@@ -1,0 +1,16 @@
+{
+  "users": {
+    "1318826936": {
+      "name": "wanglin",
+      "username": "iwillgoforwardsalone",
+      "balance": 0,
+      "orders": [],
+      "topups": []
+    }
+  },
+  "prices": {},
+  "authorized_users": [],
+  "admin_ids": [
+    1318826936
+  ]
+}
