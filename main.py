@@ -1134,7 +1134,7 @@ def main():
     # Middleware (Group 0) - Runs FIRST
     # **Important:** This setup runs check_restriction for ALL updates.
     # We rely on the logic inside check_restriction to allow admin actions.
-    application.add_handler(CommandHandler(filters.ALL, check_restriction), group=0)
+    
     application.add_handler(MessageHandler(filters.ALL, check_restriction), group=0)
     application.add_handler(CallbackQueryHandler(check_restriction), group=0)
 
