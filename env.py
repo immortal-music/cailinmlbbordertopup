@@ -1,6 +1,6 @@
 BOT_TOKEN = "8257255279:AAFp6kNzbb-KGjAykevQeuteGci_uJ8Nwds"
 ADMIN_ID = 1318826936 # သင်၏ Telegram Admin ID
-ADMIN_GROUP_ID = -100123456789 # သင်၏ Admin Group ID
+ADMIN_GROUP_ID = -1002356385851 # သင်၏ Admin Group ID
 
 # ⬇️*** MongoDB URL ကို ဤနေရာတွင် ထည့်ပါ ***⬇️
 # ဥပမာ: "mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority"
