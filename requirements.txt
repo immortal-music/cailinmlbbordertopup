@@ -1,3 +1,5 @@
-python-telegram-bot==20.7
-python-dotenv==1.0.0
-pymongo[srv]
+# requirements.txt
+
+python-telegram-bot>=20.7,<22.0 # Specify a compatible version range
+pymongo[srv]>=4.0              # Specify minimum pymongo version
+dnspython>=2.0
