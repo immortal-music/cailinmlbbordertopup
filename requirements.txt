@@ -2,3 +2,4 @@ python-telegram-bot
 pymongo
 dnspython
 python-dotenv
+bson
