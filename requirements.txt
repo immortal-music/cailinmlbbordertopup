@@ -1,11 +1,4 @@
-# requirements.txt
-
-# ไลบรารีหลักสำหรับ Telegram Bot API
-python-telegram-bot>=20.0
-
-# ไลบรารีสำหรับเชื่อมต่อกับ MongoDB
-pymongo>=4.0
-
-# (ตัวเลือกเสริม) หากคุณใช้ dnspython สำหรับ MongoDB Atlas SRV records
-# หาก pymongo มีปัญหากับ SRV records ให้ลองติดตั้งตัวนี้เพิ่ม
-# dnspython>=2.0.0
+python-telegram-bot
+pymongo
+dnspython
+python-dotenv
