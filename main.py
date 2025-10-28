@@ -1,1098 +1,947 @@
+# main.py (MongoDB Version)
+
 import json, os, asyncio
 from datetime import datetime, timedelta
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
-# env.py တွင် BOT_TOKEN, ADMIN_ID, ADMIN_GROUP_ID, MONGO_URI များ ပါဝင်ရပါမည်။
-from env import BOT_TOKEN, ADMIN_ID, ADMIN_GROUP_ID, MONGO_URI 
+import re # Calculator အတွက် import လုပ်ထားတာ
 
-# --- DB.py မှ Functions များနှင့် Collections များကို ပေါင်းစပ်ခြင်း ---
-import pymongo
-from pymongo.errors import ConnectionFailure, OperationFailure, ServerSelectionTimeoutError, ConfigurationError
+# env.py ကနေ လိုအပ်တာတွေ import လုပ်ပါ
+from env import BOT_TOKEN, ADMIN_ID, ADMIN_GROUP_ID, MONGO_URI
 
-# --- Database Global Variables (db.py မှ ကူးယူ) ---
-client = None
-db = None
-users_col = None
-settings_col = None
-clone_bots_col = None
-DATABASE_NAME = "mlbb_bot_db_v1" # Database နာမည်ကို ဒီမှာ သတ်မှတ်ပါ
+# db.py ကနေ လိုအပ်တဲ့ database objects တွေနဲ့ functions တွေကို import လုပ်ပါ
+from db import (
+    users_col, settings_col, clone_bots_col, initialize_settings,
+    load_authorized_users_db, save_authorized_users_db,
+    load_settings_db, save_settings_field_db,
+    load_prices_db, save_prices_db,
+    load_admins_db, add_admin_db, remove_admin_db,
+    load_clone_bots_db, save_clone_bot_db, remove_clone_bot_db,
+    get_clone_bot_by_admin, update_clone_bot_balance
+)
 
-try:
-    # MongoDB Atlas ကို ချိတ်ဆက်ခြင်း
-    print(f"ℹ️ MongoDB Atlas သို့ ချိတ်ဆက်နေပါသည် ({MONGO_URI[:30]}...).")
-    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000) # Timeout 5 စက္ကန့်ထားကြည့်ပါ
-    client.server_info()
-    db = client[DATABASE_NAME]
+# --- Global Variables ---
+AUTHORIZED_USERS = set()
+user_states = {}
+bot_maintenance = {"orders": True, "topups": True, "general": True} # DB ထဲ ထည့်လို့ရနိုင်သည်
+payment_info = { # DB ကနေ load လုပ်ပါမယ်
+    "kpay_number": "Default", "kpay_name": "Default", "kpay_image": None,
+    "wave_number": "Default", "wave_name": "Default", "wave_image": None
+}
+pending_topups = {}
+clone_bot_apps = {}
 
-    print(f"✅ MongoDB ({DATABASE_NAME}) ကို အောင်မြင်စွာ ချိတ်ဆက်ပြီးပါပြီ။")
+# --- Database Helper Functions (main.py specific wrappers) ---
 
-    # --- Collections ---
-    users_col = db["users"]
-    settings_col = db["settings"]
-    clone_bots_col = db["clone_bots"]
+def load_settings():
+    """ Bot settings တွေကို MongoDB ကနေ ဆွဲထုတ်ပြီး global payment_info ကို update လုပ်မယ် """
+    global payment_info
+    settings_data = load_settings_db()
+    payment_db = settings_data.get("payment_info", {})
+    # Update global dict, keeping existing keys if not found in DB
+    for key in payment_info:
+        if key in payment_db:
+            payment_info[key] = payment_db[key]
+    print("ℹ️ Settings နှင့် Payment Info ကို DB မှ ရယူပြီးပါပြီ။")
+    return settings_data
 
-except ServerSelectionTimeoutError as e:
-    print(f"❌ MongoDB သို့ ချိတ်ဆက်ရာတွင် အချိန်ကုန်သွားပါသည် (Timeout Error): {e}")
-except ConnectionFailure as e:
-    print(f"❌ MongoDB ကို ချိတ်ဆက်ရာတွင် အမှားဖြစ်ပွားနေသည် (Connection Failure): {e}")
-except ConfigurationError as e:
-    print(f"❌ MongoDB URI ('{MONGO_URI}') ပုံစံ မှားယွင်းနေသည် (Configuration Error): {e}")
-except Exception as e:
-    print(f"❌ MongoDB ချိတ်ဆက်ရာတွင် မမျှော်လင့်သော အမှားဖြစ်ပွားနေသည်: {e}")
-    client = None
-    db = None
-    users_col = None
-    settings_col = None
-    clone_bots_col = None
-
-
-# --- DB.py မှ Database Functions များကို ကူးယူခြင်း ---
-
-def load_settings_db():
-    if settings_col is None:
-        return {"prices": {}, "authorized_users": [], "admin_ids": [ADMIN_ID], 
-                "maintenance_mode": {"orders": False, "topups": False, "general": False}}
-    try:
-        settings_data = settings_col.find_one({"_id": "bot_config"})
-        if settings_data:
-            settings_data.setdefault("prices", {})
-            settings_data.setdefault("authorized_users", [])
-            settings_data.setdefault("admin_ids", [ADMIN_ID])
-            settings_data.setdefault("maintenance_mode", {"orders": False, "topups": False, "general": False})
-            settings_data.setdefault("payment_info", {})
-            return settings_data
-        else:
-            return load_settings_db() # Recursively call to get default if not found
-    except Exception as e:
-        print(f"❌ Settings များ ရယူရာတွင် အမှားဖြစ်ပွားနေသည်: {e}")
-        return load_settings_db() # Return default if error occurred
-
-def save_settings_field_db(field_name, value):
-    if settings_col is None:
-        print("❌ Settings collection မရှိပါ။ Settings မသိမ်းနိုင်ပါ။")
-        return False
-    try:
-        settings_col.update_one(
-            {"_id": "bot_config"},
-            {"$set": {field_name: value}},
-            upsert=True
-        )
-        return True
-    except Exception as e:
-        print(f"❌ Settings ({field_name}) သိမ်းရာတွင် အမှားဖြစ်ပွားနေသည်: {e}")
-        return False
-
-# --- Initialization Function (db.py မှ ကူးယူ) ---
-def initialize_settings():
-    if settings_col is not None:
+def save_settings_field(field_name, value):
+    """ Settings document ထဲက field တစ်ခုကို update လုပ်မယ် """
+    # payment_info ကို update လုပ်ရင် global variable ကိုပါ update လုပ်မယ်
+    if field_name == "payment_info":
+        global payment_info
+        payment_info = value # Update global dict first
+    elif field_name.startswith("payment_info."):
         try:
-            if settings_col.count_documents({"_id": "bot_config"}) == 0:
-                print("ℹ️ MongoDB ထဲတွင် default bot settings များ ထည့်သွင်းနေပါသည်...")
-                default_settings = {
-                    "_id": "bot_config",
-                    "prices": {},
-                    "authorized_users": [],
-                    "admin_ids": [ADMIN_ID],
-                    "maintenance_mode": {"orders": False, "topups": False, "general": False},
-                    "payment_info": { # Default payment info
-                        "kpay_number": "09678786528",
-                        "kpay_name": "Ma May Phoo Wai",
-                        "kpay_image": None,
-                        "wave_number": "09673585480",
-                        "wave_name": "Nine Nine",
-                        "wave_image": None
-                    }
-                }
-                settings_col.insert_one(default_settings)
-                print("✅ Default settings များ ထည့်သွင်းပြီးပါပြီ။")
-            else:
-                print("ℹ️ Default settings document ရှိပြီးသားဖြစ်ပါသည်။")
-        except Exception as e:
-            print(f"❌ Default settings များ စစ်ဆေး/ထည့်သွင်းရာတွင် အမှားဖြစ်ပွားနေသည်: {e}")
+            key = field_name.split('.')[-1]
+            if key in payment_info: payment_info[key] = value
+        except IndexError: pass
+    return save_settings_field_db(field_name, value) # db.py ထဲက function
 
-# Run initialization only if DB connected
-if db is not None:
-    initialize_settings()
+def load_authorized_users():
+    global AUTHORIZED_USERS
+    authorized_list = load_authorized_users_db()
+    AUTHORIZED_USERS = set(map(str, authorized_list))
+    print(f"ℹ️ Authorized users {len(AUTHORIZED_USERS)} Loaded.")
 
-# --- Database Access Wrapper Functions ---
-def check_db_connection():
-    """Check if MongoDB client is connected"""
-    global client
-    if client is None:
-        return False
-    try:
-        client.admin.command('ismaster')
-        return True
-    except (ConnectionFailure, OperationFailure, Exception):
-        return False
+def save_authorized_users():
+    if save_authorized_users_db(list(AUTHORIZED_USERS)): print(f"ℹ️ Authorized users {len(AUTHORIZED_USERS)} Saved.")
+    else: print("❌ Authorized users Save Error.")
 
-async def get_user_data_db(user_id):
-    """Get all user data from Database (Async wrapper)"""
-    global users_col
+def load_prices(): return load_prices_db()
+def save_prices(prices): return save_prices_db(prices)
+
+def get_user_data(user_id):
     if users_col is None: return None
     try:
-        return await asyncio.to_thread(users_col.find_one, {"_id": str(user_id)})
-    except Exception as e:
-        print(f"MongoDB Error getting user data: {e}")
-        return None
+        user_data = users_col.find_one({"_id": str(user_id)})
+        if user_data:
+            user_data.setdefault("balance", 0); user_data.setdefault("orders", [])
+            user_data.setdefault("topups", []); user_data.setdefault("name", "Unknown")
+            user_data.setdefault("username", "-")
+        return user_data
+    except Exception as e: print(f"❌ Get User {user_id} Error: {e}"); return None
 
-async def get_user_balance_db(user_id):
-    """Get user balance from Database (Async wrapper)"""
-    user_data = await get_user_data_db(user_id)
-    return user_data.get("balance", 0) if user_data else 0
-
-async def initialize_user_db(user_id, name, username):
-    """Initialize user document if it doesn't exist (Async wrapper)"""
-    global users_col
-    if users_col is None: return 
-
-    user_doc = {
-        "_id": str(user_id),
-        "name": name,
-        "username": username,
-        "balance": 0,
-        "orders": [],
-        "topups": [],
-        "created_at": datetime.now().isoformat()
-    }
-    try:
-        await asyncio.to_thread(users_col.update_one, 
-            {"_id": str(user_id)},
-            {"$set": {"name": name, "username": username}, 
-             "$setOnInsert": user_doc},
-            upsert=True
-        )
-    except Exception as e:
-        print(f"MongoDB Error initializing user: {e}")
-
-async def process_order_db(user_id, order):
-    """Deduct balance and save order to Database (Atomic Async wrapper)"""
-    global users_col
+def update_user_data(user_id, update_fields):
     if users_col is None: return False
+    try: users_col.update_one({"_id": str(user_id)}, {"$set": update_fields}, upsert=True); return True
+    except Exception as e: print(f"❌ Update User {user_id} Error: {e}"); return False
 
-    try:
-        result = await asyncio.to_thread(users_col.update_one,
-            {"_id": str(user_id), "balance": {"$gte": order["price"]}},
-            {"$inc": {"balance": -order["price"]},
-             "$push": {"orders": order}}
-        )
-        return result.modified_count > 0
-    except Exception as e:
-        print(f"MongoDB Error processing order: {e}")
-        return False
-
-async def check_pending_topup(user_id):
-    """Check if user has pending topups (in Database) (Async wrapper)"""
-    global users_col
+def increment_user_balance(user_id, amount):
     if users_col is None: return False
-
     try:
-        user_doc = await asyncio.to_thread(users_col.find_one, 
-            {"_id": str(user_id)}, 
-            {"topups": {"$slice": -1}}
-        )
-        if user_doc and user_doc.get("topups"):
-            last_topup = user_doc["topups"][-1]
-            return last_topup.get("status") == "pending"
-        return False
-    except Exception as e:
-        print(f"MongoDB Error in check_pending_topup: {e}")
-        return False
-        
-async def save_bot_config_field_async(field_name, value):
-    """Save a specific field to the settings collection (Async wrapper)"""
-    return await asyncio.to_thread(save_settings_field_db, field_name, value)
-    
-# --- Global Variables & Config Loading ---
-
-# SETTINGS ကို အရင် Load လုပ်၊ မအောင်မြင်ရင် Default ယူ
-INITIAL_SETTINGS = load_settings_db()
-AUTHORIZED_USERS = set(INITIAL_SETTINGS.get("authorized_users", []))
-ADMIN_IDS = set(INITIAL_SETTINGS.get("admin_ids", [ADMIN_ID]))
-PRICES = INITIAL_SETTINGS.get("prices", {})
-bot_maintenance = INITIAL_SETTINGS.get("maintenance_mode", {"orders": False, "topups": False, "general": False})
-payment_info = INITIAL_SETTINGS.get("payment_info", {
-    "kpay_number": "09678786528",
-    "kpay_name": "Ma May Phoo Wai",
-    "kpay_image": None,
-    "wave_number": "09673585480",
-    "wave_name": "Nine Nine",
-    "wave_image": None
-})
-
-user_states = {}
-pending_topups = {} 
-clone_bot_apps = {} 
-
-async def load_bot_config():
-    """Bot config အားလုံးကို Database မှ ပြန်လည် Load လုပ်ခြင်း"""
-    global AUTHORIZED_USERS, ADMIN_IDS, PRICES, bot_maintenance, payment_info
-
-    if settings_col is None:
-        print("⚠️ Settings Collection is not available. Using local cache.")
-        return
-
-    try:
-        db_settings = await asyncio.to_thread(load_settings_db)
-        if not db_settings:
-            return
-
-        AUTHORIZED_USERS = set(db_settings.get("authorized_users", []))
-        ADMIN_IDS = set(db_settings.get("admin_ids", [ADMIN_ID]))
-        PRICES = db_settings.get("prices", {})
-        
-        db_maintenance = db_settings.get("maintenance_mode", None)
-        if isinstance(db_maintenance, dict):
-            bot_maintenance.update(db_maintenance)
-            
-        db_payment_info = db_settings.get("payment_info", None)
-        if isinstance(db_payment_info, dict):
-            # local payment_info ကို DB data ဖြင့် update လုပ်ပါ
-            payment_info.update(db_payment_info) 
-
-    except Exception as e:
-        print(f"❌ Error loading bot config from DB: {e}. Using local cache.")
-
-
-# --- Utility/Helper Functions (Local checks) ---
-
-def is_user_authorized(user_id):
-    """Check if user is authorized to use the bot (Local Cache Check)"""
-    global AUTHORIZED_USERS
-    return str(user_id) in AUTHORIZED_USERS or int(user_id) == ADMIN_ID
-
-def is_owner(user_id):
-    """Check if user is the owner (ADMIN_ID)"""
-    return int(user_id) == ADMIN_ID
-
-def is_admin(user_id):
-    """Check if user is any admin (owner or appointed admin) (Local Cache Check)"""
-    global ADMIN_IDS
-    return int(user_id) in ADMIN_IDS
-
-def get_price(diamonds):
-    """Get price for a diamond amount, checking custom prices first (Local Cache Check)"""
-    global PRICES
-    
-    # ... (Price calculation logic - uses global PRICES)
-    if diamonds in PRICES:
-        return PRICES[diamonds]
-
-    if diamonds.startswith("wp") and diamonds[2:].isdigit():
-        n = int(diamonds[2:])
-        if 1 <= n <= 10:
-            return n * 6000
-    table = {
-        "11": 950, "22": 1900, "33": 2850, "56": 4200, "112": 8200,
-        "86": 5100, "172": 10200, "257": 15300, "343": 20400,
-        "429": 25500, "514": 30600, "600": 35700, "706": 40800,
-        "878": 51000, "963": 56100, "1049": 61200, "1135": 66300,
-        "1412": 81600, "2195": 122400, "3688": 204000,
-        "5532": 306000, "9288": 510000, "12976": 714000,
-        "55": 3500, "165": 10000, "275": 16000, "565": 33000
-    }
-    return table.get(diamonds)
-
-async def is_bot_admin_in_group(bot, chat_id):
-    # ... (Unchanged logic)
-    try:
-        me = await bot.get_me()
-        bot_member = await bot.get_chat_member(chat_id, me.id)
-        is_admin = bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
-        return is_admin
-    except Exception:
-        return False
-
-def simple_reply(message_text):
-    # ... (Unchanged logic)
-    message_lower = message_text.lower()
-    if any(word in message_lower for word in ["hello", "hi", "မင်္ဂလာပါ", "ဟယ်လို", "ဟိုင်း", "ကောင်းလား"]):
-        return ("👋 မင်္ဂလာပါ! 𝙆𝙀𝘼 𝙈𝙇𝘽𝘽 𝘼𝙐𝙏𝙊 𝙏𝙊𝙋 𝙐𝙋 𝘽𝙊𝙏 မှ ကြိုဆိုပါတယ်!\n\n"
-                  "📱 Bot commands များ သုံးရန် /start နှိပ်ပါ\n")
-    elif any(word in message_lower for word in ["help", "ကူညီ", "အကူအညီ", "မသိ", "လမ်းညွှန်"]):
-        return ("📱 ***အသုံးပြုနိုင်တဲ့ commands:***\n\n"
-                  "• /start - Bot စတင်အသုံးပြုရန်\n"
-                  "• /mmb gameid serverid amount - Diamond ဝယ်ယူရန်\n"
-                  "• /balance - လက်ကျန်ငွေ စစ်ရန်\n"
-                  "• /topup amount - ငွေဖြည့်ရန်\n"
-                  "• /price - ဈေးနှုန်းများ ကြည့်ရန်\n"
-                  "• /history - မှတ်တမ်းများ ကြည့်ရန်\n\n"
-                  "💡 အသေးစိတ် လိုအပ်ရင် admin ကို ဆက်သွယ်ပါ!")
-    else:
-        return ("📱 ***MLBB Diamond Top-up Bot***\n\n"
-                  "💎 ***Diamond ဝယ်ယူရန် /mmb command သုံးပါ။***\n"
-                  "💰 ***ဈေးနှုန်းများ သိရှိရန် /price နှိပ်ပါ။***\n"
-                  "🆘 ***အကူအညီ လိုရင် /start နှိပ်ပါ။***")
-
-def validate_game_id(game_id):
-    # ... (Unchanged logic)
-    if not game_id.isdigit() or len(game_id) < 6 or len(game_id) > 10:
-        return False
-    return True
-
-def validate_server_id(server_id):
-    # ... (Unchanged logic)
-    if not server_id.isdigit() or len(server_id) < 3 or len(server_id) > 5:
-        return False
-    return True
-
-def is_banned_account(game_id):
-    # ... (Unchanged mock logic)
-    banned_ids = ["123456789", "000000000", "111111111"]
-    if game_id in banned_ids or len(set(game_id)) == 1 or game_id.startswith("000") or game_id.endswith("000"):
+        result = users_col.update_one({"_id": str(user_id)}, {"$inc": {"balance": amount}}, upsert=True)
+        if result.upserted_id: users_col.update_one({"_id": str(user_id)}, {"$setOnInsert": {"name": "New User", "username": "-", "orders": [], "topups": []}}, upsert=True)
         return True
-    return False
+    except Exception as e: print(f"❌ Inc Balance {user_id} Error: {e}"); return False
 
-def is_payment_screenshot(update):
-    # ... (Unchanged logic)
-    return update.message.photo is not None
+def add_to_user_list(user_id, list_field, item):
+    if users_col is None: return False
+    try:
+        users_col.update_one({"_id": str(user_id)}, {"$setOnInsert": {list_field: []}}, upsert=True)
+        users_col.update_one({"_id": str(user_id)}, {"$push": {list_field: item}})
+        return True
+    except Exception as e: print(f"❌ Push List {user_id}.{list_field} Error: {e}"); return False
 
-async def send_pending_topup_warning(update: Update):
-    # ... (Unchanged logic)
-    await update.message.reply_text(
-        "⏳ ***Pending Topup ရှိနေပါတယ်!***\n\n"
-        "❌ သင့်မှာ admin က approve မလုပ်သေးတဲ့ topup ရှိနေပါတယ်။\n\n"
-        "***လုပ်ရမည့်အရာများ***:\n"
-        "***• Admin က topup ကို approve လုပ်ပေးတဲ့အထိ စောင့်ပါ။***\n"
-        "***• Approve ရပြီးမှ command တွေကို ပြန်အသုံးပြုနိုင်ပါမယ်။***\n\n"
-        "📞 ***အရေးပေါ်ဆိုရင် admin ကို ဆက်သွယ်ပါ။***\n\n"
-        "💡 /balance ***နဲ့ status စစ်ကြည့်နိုင်ပါတယ်။***",
-        parse_mode="Markdown"
-    )
+def find_and_update_order_mongo(order_id, update_fields_without_prefix):
+    if users_col is None: return None, None
+    try:
+        user_doc = users_col.find_one({"orders.order_id": order_id})
+        if not user_doc: return None, None
+        target_user_id = user_doc["_id"]; original_order = None; order_index = -1
+        for i, o in enumerate(user_doc.get("orders", [])):
+             if o.get("order_id") == order_id: original_order = o; order_index = i; break
+        if not original_order or order_index == -1: return None, None
+        update_query = { f"orders.{order_index}.{key}": value for key, value in update_fields_without_prefix.items() }
+        result = users_col.update_one({"_id": target_user_id, f"orders.{order_index}.order_id": order_id}, {"$set": update_query})
+        if result.modified_count > 0: updated_order_data = {**original_order, **update_fields_without_prefix}; return target_user_id, updated_order_data
+        elif result.matched_count > 0: print(f"ℹ️ Order ({order_id}) matched but not modified."); return target_user_id, original_order
+        else: print(f"❌ Order ({order_id}) update match error."); return None, None
+    except Exception as e: print(f"❌ Order ({order_id}) update error: {e}"); return None, None
 
-async def check_maintenance_mode(command_type):
-    """Check if specific command type is in maintenance mode (Local Cache Check)"""
-    global bot_maintenance
-    return bot_maintenance.get(command_type, False) # Default to False: Bot is ON by default
+def find_and_update_topup_mongo(topup_id, update_fields_without_prefix):
+    if users_col is None: return None, None, None
+    try:
+        user_doc = users_col.find_one({"topups.topup_id": topup_id})
+        if not user_doc: return None, None, None
+        target_user_id = user_doc["_id"]; original_topup = None; topup_index = -1
+        for i, t in enumerate(user_doc.get("topups", [])):
+             if t.get("topup_id") == topup_id: original_topup = t; topup_index = i; break
+        if not original_topup or topup_index == -1: return None, None, None
+        status_before = original_topup.get("status"); topup_amount = original_topup.get("amount", 0)
+        update_query = { f"topups.{topup_index}.{key}": value for key, value in update_fields_without_prefix.items() }
+        result = users_col.update_one({"_id": target_user_id, f"topups.{topup_index}.topup_id": topup_id}, {"$set": update_query})
+        if result.modified_count > 0: return target_user_id, topup_amount, status_before
+        elif result.matched_count > 0: print(f"ℹ️ Topup ({topup_id}) matched but not modified."); return target_user_id, topup_amount, status_before
+        else: print(f"❌ Topup ({topup_id}) update match error."); return None, None, None
+    except Exception as e: print(f"❌ Topup ({topup_id}) update error: {e}"); return None, None, None
 
-async def send_maintenance_message(update: Update, command_type):
-    # ... (Unchanged logic)
-    user_name = update.effective_user.first_name or "User"
-    # ... (Maintenance message details)
-    if command_type == "orders":
-        msg = ("...orders message...")
-    elif command_type == "topups":
-        msg = ("...topups message...")
-    else:
-        msg = ("...general message...")
-    
-    # Simplified message for brevity
-    msg = f"***မင်္ဂလာပါ*** {user_name}! 👋\n\n" \
-          "━━━━━━━━━━━━━━━━━━━━━━━━\n" \
-          "⏸️ ***Bot လုပ်ဆောင်ချက် ခေတ္တ ယာယီပိတ်ထားပါသည်** ⏸️***\n" \
-          "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" \
-          "📞 အရေးပေါ်ဆိုရင် Admin ကို ဆက်သွယ်ပါ။"
-          
-    await update.message.reply_text(msg, parse_mode="Markdown")
+def get_admins(): return load_admins_db()
 
-# -----------------------------------------------
-# --- Command Handlers (DB Integrated) ---
-# -----------------------------------------------
+# --- Utility Functions ---
+def is_user_authorized(user_id): return str(user_id) in AUTHORIZED_USERS or is_admin(str(user_id))
+async def is_bot_admin_in_group(bot, chat_id):
+    if not chat_id: return False
+    try:
+        me = await bot.get_me(); bot_member = await bot.get_chat_member(chat_id, me.id)
+        is_admin_status = bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+        print(f"Bot admin check group {chat_id}: {is_admin_status}, status: {bot_member.status}"); return is_admin_status
+    except Exception as e: print(f"Error check bot admin group {chat_id}: {e}"); return False
+def simple_reply(message_text):
+    message_lower = message_text.lower()
+    if any(w in message_lower for w in ["hello","hi","မင်္ဂလာပါ","ဟယ်လို","ဟိုင်း","ကောင်းလား"]): return "👋 မင်္ဂလာပါ! /start နှိပ်ပါ"
+    elif any(w in message_lower for w in ["help","ကူညီ","အကူအညီ","မသိ","လမ်းညွှန်"]): return "📱 Commands:\n• /start\n• /mmb\n• /balance\n• /topup\n• /price\n• /history"
+    else: return "📱 ***MLBB Bot***\n💎 /mmb သုံးပါ\n💰 /price နှိပ်ပါ\n🆘 /start နှိပ်ပါ"
+def validate_game_id(g): return g and g.isdigit() and 6<=len(g)<=10
+def validate_server_id(s): return s and s.isdigit() and 3<=len(s)<=5
+def is_banned_account(g): b=["123456789","000000000","111111111"]; return g in b or (len(set(g))==1 and len(g)>5) or g.startswith("000") or g.endswith("000")
+def get_price(d):
+    cp=load_prices();
+    if d in cp: return cp[d]
+    if d.startswith("wp") and d[2:].isdigit(): n=int(d[2:]); return n*6000 if 1<=n<=10 else None # Example price
+    t={"11":950,"22":1900,"33":2850,"56":4200,"112":8200,"86":5100,"172":10200,"257":15300,"343":20400,"429":25500,"514":30600,"600":35700,"706":40800,"878":51000,"963":56100,"1049":61200,"1135":66300,"1412":81600,"2195":122400,"3688":204000,"5532":306000,"9288":510000,"12976":714000,"55":3500,"165":10000,"275":16000,"565":33000}
+    return t.get(d)
+def is_payment_screenshot(up): return up.message and up.message.photo
+async def check_pending_topup(uid): ud=get_user_data(uid); return any(t.get("status")=="pending" for t in ud.get("topups",[])) if ud else False
+async def send_pending_topup_warning(up:Update): await up.message.reply_text("⏳ ***Pending Topup ရှိ!***\n❌ Admin approve စောင့်ပါ။\n📞 Admin ကို ဆက်သွယ်ပါ။\n💡 /balance နဲ့ စစ်ပါ။",parse_mode="Markdown")
+async def check_maintenance_mode(ct): return bot_maintenance.get(ct,True)
+async def send_maintenance_message(up:Update, ct): un=up.effective_user.first_name or "User"; msg=f"👋 {un}\n"; if ct=="orders":msg+="⏸️ ***Order ပိတ်ထားသည်** ⏸️"; elif ct=="topups": msg+="⏸️ ***ငွေဖြည့် ပိတ်ထားသည်*** ⏸️"; else: msg+="⏸️ ***Bot ပိတ်ထားသည်*** ⏸️"; msg+="\n🔄 Admin ဖွင့်မှ သုံးပါ။\n📞 Admin ကို ဆက်သွယ်ပါ။"; await up.message.reply_text(msg,parse_mode="Markdown")
+def is_owner(uid): try: return int(uid)==ADMIN_ID except: return False
+def is_admin(uid): try: uid_int=int(uid); return uid_int==ADMIN_ID or uid_int in get_admins() except: return False
+
+# --- Command Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = str(user.id)
-    username = user.username or "-"
-    name = f"{user.first_name} {user.last_name or ''}".strip()
-
-    await load_bot_config()
-
+    user = update.effective_user; user_id = str(user.id)
+    username = user.username or "-"; name = f"{user.first_name} {user.last_name or ''}".strip()
     if not is_user_authorized(user_id):
-        keyboard = [
-            [InlineKeyboardButton("📝 Register တောင်းဆိုမယ်", callback_data="request_register")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        # ... (Unauthorized message code) ...
-        await update.message.reply_text(
-            f"🚫 ***Bot အသုံးပြုခွင့် မရှိပါ!***\n\n"
-            f"👋 ***မင်္ဂလာပါ*** `{name}`!\n"
-            f"🆔 Your ID: `{user_id}`\n\n"
-            "❌ ***သင်သည် ဤ bot ကို အသုံးပြုခွင့် မရှိသေးပါ။***\n\n",
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
-        return
-
-    if await check_pending_topup(user_id):
-        await send_pending_topup_warning(update)
-        return
-
-    await initialize_user_db(user_id, name, username)
-
-    if user_id in user_states:
-        del user_states[user_id]
-
-    user_balance = await get_user_balance_db(user_id)
+        kb = [[InlineKeyboardButton("📝 Register တောင်းဆို", callback_data="request_register")]]; markup=InlineKeyboardMarkup(kb)
+        await update.message.reply_text(f"🚫 ***Bot သုံးခွင့်မရှိ!***\n\n👋 `{name}`!\n🆔 `{user_id}`\n\n❌ ***သုံးခွင့်တောင်းပါ***\n\n• Button နှိပ်\n• /register သုံး\n• Admin approve စောင့်", parse_mode="Markdown", reply_markup=markup); return
+    if await check_pending_topup(user_id): await send_pending_topup_warning(update); return
+    user_data = get_user_data(user_id)
+    if not user_data:
+        print(f"Creating user {user_id} in /start"); initial_data = {"_id": user_id, "name": name, "username": username, "balance": 0, "orders": [], "topups": []}
+        if users_col: try: users_col.insert_one(initial_data) except Exception as e: print(f"❌ User insert error: {e}")
+        else: print("❌ DB conn error")
+    elif user_data.get("name") != name or user_data.get("username") != username: update_user_data(user_id, {"name": name, "username": username})
+    if user_id in user_states: del user_states[user_id]
     clickable_name = f"[{name}](tg://user?id={user_id})"
-
-    msg = (
-        f"👋 ***မင်္ဂလာပါ*** {clickable_name}!\n"
-        f"🆔 ***Telegram User ID:*** `{user_id}`\n"
-        f"💳 ***လက်ကျန်ငွေ:*** `{user_balance:,} MMK`\n\n" 
-        "💎 ***𝙆𝙀𝘼 𝙈𝙇𝘽𝘽 𝘼𝙐𝙏𝙊 𝙏𝙊𝙋 𝙐𝙋 𝘽𝙊𝙏*** မှ ကြိုဆိုပါတယ်။\n\n"
-        "***အသုံးပြုနိုင်တဲ့ command များ***:\n"
-        "➤ /mmb gameid serverid amount\n"
-        "➤ /balance - ဘယ်လောက်လက်ကျန်ရှိလဲ စစ်မယ်\n"
-        "➤ /topup amount - ငွေဖြည့်မယ် (screenshot တင်ပါ)\n"
-        "➤ /price - Diamond များရဲ့ ဈေးနှုန်းများ\n"
-        "➤ /history - အော်ဒါမှတ်တမ်းကြည့်မယ်\n\n"
-        "***📌 ဥပမာ***:\n"
-        "`/mmb 123456789 12345 wp1`\n"
-        "***လိုအပ်တာရှိရင် Owner ကို ဆက်သွယ်နိုင်ပါတယ်။***"
-    )
-
+    msg = (f"👋 ***မင်္ဂလာပါ*** {clickable_name}!\n🆔 `{user_id}`\n\n💎 ***𝙆𝙀𝘼 𝙈𝙇𝘽𝘽 𝘼𝙐𝙏𝙊 𝙏𝙊𝙋 𝙐𝙋 𝘽𝙊𝙏***\n\n***Commands***:\n➤ /mmb\n➤ /balance\n➤ /topup\n➤ /price\n➤ /history\n\n📌 ဥပမာ:\n`/mmb 123 12 wp1`\n`/mmb 456 45 86`\n\n📞 Owner ကို ဆက်သွယ်ပါ။")
     try:
-        user_photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
-        if user_photos.total_count > 0:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=user_photos.photos[0][0].file_id,
-                caption=msg,
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
+        if photos.total_count > 0: await context.bot.send_photo(chat_id=update.effective_chat.id, photo=photos.photos[0][0].file_id, caption=msg, parse_mode="Markdown")
+        else: await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e: print(f"Error photo /start: {e}"); await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def mmb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-
-    await load_bot_config()
-
-    if not is_user_authorized(user_id):
-        # ... (Unauthorized message code) ...
-        return
-
-    if await check_maintenance_mode("orders"):
-        await send_maintenance_message(update, "orders")
-        return
-
-    if user_id in user_states and user_states[user_id] == "waiting_approval":
-        # ... (Restricted message code) ...
-        return
-
-    if await check_pending_topup(user_id):
-        await send_pending_topup_warning(update)
-        return
-
-    if user_id in pending_topups:
-        # ... (Pending topup process message code) ...
-        return
+    if not is_user_authorized(user_id): kb=[[InlineKeyboardButton("👑 Owner",url=f"tg://user?id={ADMIN_ID}")]]; await update.message.reply_text("🚫 သုံးခွင့်မရှိပါ။",reply_markup=InlineKeyboardMarkup(kb)); return
+    if not await check_maintenance_mode("orders"): await send_maintenance_message(update, "orders"); return
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("⏳ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if await check_pending_topup(user_id): await send_pending_topup_warning(update); return
+    if user_id in pending_topups: await update.message.reply_text("⏳ ***Topup အရင်ပြီးအောင်လုပ်ပါ!***",parse_mode="Markdown"); return
 
     args = context.args
-    if len(args) != 3:
-        # ... (Error message code) ...
-        return
-
-    game_id, server_id, amount = args
-
-    if not validate_game_id(game_id) or not validate_server_id(server_id):
-        # ... (Validation error message code) ...
-        return
+    if len(args) != 3: await update.message.reply_text("❌ Format:\n/mmb gameid serverid amount\nဥပမာ:\n`/mmb 123 12 86`", parse_mode="Markdown"); return
+    game_id, server_id, amount_str = args
+    if not validate_game_id(game_id): return await update.message.reply_text("❌ ***Game ID မှား!***", parse_mode="Markdown")
+    if not validate_server_id(server_id): return await update.message.reply_text("❌ ***Server ID မှား!***", parse_mode="Markdown")
 
     if is_banned_account(game_id):
-        # ... (Banned account message code) ...
-        return
+        await update.message.reply_text(f"🚫 ***Account Ban!*** ID: `{game_id}`\n❌ Topup လုပ်မရပါ။", parse_mode="Markdown")
+        admin_msg = (f"🚫 ***Banned Account***\n👤 [{update.effective_user.first_name}](tg://user?id={user_id})\n🎮 `{game_id}` (`{server_id}`) Amt: {amount_str}")
+        admins=get_admins(); asyncio.gather(*[context.bot.send_message(chat_id=aid, text=admin_msg, parse_mode="Markdown") for aid in admins]); return
 
-    price = get_price(amount)
-    if not price:
-        # ... (Invalid diamond amount message code) ...
-        return
+    price = get_price(amount_str)
+    if not price: await update.message.reply_text("❌ Diamond amount မှား!\n/price ကို ကြည့်ပါ။", parse_mode="Markdown"); return
 
-    user_balance = await get_user_balance_db(user_id)
-
+    user_data = get_user_data(user_id); user_balance = user_data.get("balance", 0) if user_data else 0
     if user_balance < price:
-        # ... (Insufficient balance message code) ...
+        kb=[[InlineKeyboardButton("💳 ငွေဖြည့်", callback_data="topup_button")]]; markup=InlineKeyboardMarkup(kb)
+        await update.message.reply_text(f"❌ ***Balance မလုံလောက်!***\n💰 လိုအပ်: {price:,}\n💳 လက်ကျန်: {user_balance:,}\n❗ လိုသေး: {price - user_balance:,}\n`/topup amount` သုံးပါ။", parse_mode="Markdown", reply_markup=markup); return
+
+    order_id = f"ORD{datetime.now().strftime('%y%m%d%H%M')}{user_id[-2:]}"
+    order_data = {"order_id": order_id, "game_id": game_id, "server_id": server_id, "amount": amount_str, "price": price, "status": "pending", "timestamp": datetime.now().isoformat(), "chat_id": update.effective_chat.id}
+    bal_ok = increment_user_balance(user_id, -price); ord_ok = add_to_user_list(user_id, "orders", order_data)
+
+    if not (bal_ok and ord_ok):
+        print(f"❌ Order fail {order_id} user {user_id}. BalOK:{bal_ok}, OrdOK:{ord_ok}")
+        if bal_ok and not ord_ok: increment_user_balance(user_id, price); await update.message.reply_text("❌ Order DB Error! ငွေ ပြန်အမ်းပြီး။")
+        else: await update.message.reply_text("❌ Order Error!")
         return
 
-    # --- DB Call: Process Order ---
-    order_id = f"ORD{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    order = {
-        "order_id": order_id, "game_id": game_id, "server_id": server_id,
-        "amount": amount, "price": price, "status": "pending",
-        "timestamp": datetime.now().isoformat(), "user_id": user_id,
-        "chat_id": update.effective_chat.id
-    }
+    ud = get_user_data(user_id); nb = ud.get("balance", 0) if ud else user_balance - price
+    await update.message.reply_text(f"✅ ***Order OK!***\n📝 ID: `{order_id}`\n🎮 `{game_id}` (`{server_id}`) 💎 {amount_str}\n💰 ကုန်ကျ: {price:,}\n💳 လက်ကျန်: {nb:,}\n📊 Status: ⏳ ***Pending***\n⚠️ ***Admin confirm စောင့်ပါ။***", parse_mode="Markdown")
 
-    if not await process_order_db(user_id, order):
-        await update.message.reply_text("❌ ***အော်ဒါတင်ရာတွင် အမှားဖြစ်ပွားပါသည် (Database Error)***")
-        return
-        
-    user_name = f"{update.effective_user.first_name} {update.effective_user.last_name or ''}".strip()
-    keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data=f"order_confirm_{order_id}"),
-                 InlineKeyboardButton("❌ Cancel", callback_data=f"order_cancel_{order_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    kb=[[InlineKeyboardButton("✅ Confirm", callback_data=f"order_confirm_{order_id}"), InlineKeyboardButton("❌ Cancel", callback_data=f"order_cancel_{order_id}")]]
+    markup=InlineKeyboardMarkup(kb); un = update.effective_user.first_name or user_id
+    admin_msg = (f"🔔 ***Order!*** ID: `{order_id}`\n👤 [{un}](tg://user?id={user_id})\n🎮 `{game_id}` (`{server_id}`) 💎 {amount_str}\n💰 {price:,} MMK\n📊 ⏳ Pending")
+    admins=get_admins(); asyncio.gather(*[context.bot.send_message(chat_id=aid, text=admin_msg, parse_mode="Markdown", reply_markup=markup) for aid in admins])
 
-    admin_msg = (f"🔔 ***အော်ဒါအသစ်ရောက်ပါပြီ!***\n\n"
-                 f"📝 ***Order ID:*** `{order_id}`\n"
-                 f"👤 ***User Name:*** [{user_name}](tg://user?id={user_id})\n\n"
-                 f"🎮 ***Game ID:*** `{game_id}`\n"
-                 f"💰 ***Price:*** {price:,} MMK\n"
-                 f"📊 Status: ⏳ ***စောင့်ဆိုင်းနေသည်***")
-    
-    for admin_id in ADMIN_IDS:
+    if ADMIN_GROUP_ID:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id, text=admin_msg, parse_mode="Markdown", reply_markup=reply_markup
-            )
-        except:
-            pass
-
-    new_user_balance = await get_user_balance_db(user_id)
-
-    await update.message.reply_text(
-        f"✅ ***အော်ဒါ အောင်မြင်ပါပြီ!***\n\n"
-        f"📝 ***Order ID:*** `{order_id}`\n"
-        f"💳 ***လက်ကျန်ငွေ:*** {new_user_balance:,} MMK\n"
-        f"📊 Status: ⏳ ***စောင့်ဆိုင်းနေသည်***\n\n"
-        "⚠️ ***Admin က confirm လုပ်ပြီးမှ diamonds များ ရရှိပါမယ်။***",
-        parse_mode="Markdown"
-    )
+            if await is_bot_admin_in_group(context.bot, ADMIN_GROUP_ID):
+                gmsg = (f"🛒 Order `{order_id}`\n👤 [{un}](tg://user?id={user_id})\n🎮 `{game_id}` (`{server_id}`) 💎 {amount_str} ({price:,} MMK)\n#NewOrder")
+                await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=gmsg, parse_mode="Markdown")
+        except Exception as e: print(f"Fail send order group {ADMIN_GROUP_ID}: {e}")
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not is_user_authorized(user_id): kb=[[InlineKeyboardButton("👑 Owner",url=f"tg://user?id={ADMIN_ID}")]]; await update.message.reply_text("🚫 သုံးခွင့်မရှိပါ။",reply_markup=InlineKeyboardMarkup(kb)); return
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("⏳ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if user_id in pending_topups: await update.message.reply_text("⏳ ***Topup ဆက်လုပ်ပါ။***",parse_mode="Markdown"); return
 
-    await load_bot_config()
+    user_data = get_user_data(user_id)
+    if not user_data: await update.message.reply_text("❌ /start ကို အရင်နှိပ်ပါ။"); return
 
-    if not is_user_authorized(user_id):
-        # ... (Unauthorized message code) ...
-        return
+    bal = user_data.get("balance", 0); orders_n = len(user_data.get("orders", [])); topups_n = len(user_data.get("topups", []))
+    name = user_data.get('name','?').replace('*','').replace('_','').replace('`',''); un = user_data.get('username','-').replace('*','').replace('_','').replace('`','')
+    un_disp = f"@{un}" if un and un != "-" else "None"
 
-    if user_id in user_states and user_states[user_id] == "waiting_approval":
-        # ... (Restricted message code) ...
-        return
+    pend_n=0; pend_amt=0
+    for t in user_data.get("topups", []):
+        if t.get("status") == "pending": pend_n+=1; pend_amt+=t.get("amount",0)
+    st_msg = f"\n⏳ Pending: {pend_n} ({pend_amt:,} MMK)\n❗ Order ထားမရပါ။" if pend_n>0 else ""
 
-    if user_id in pending_topups or await check_pending_topup(user_id):
-        await send_pending_topup_warning(update)
-        return
-
-    # --- DB Call: Get User Data ---
-    user_data = await get_user_data_db(user_id)
-
-    if not user_data:
-        await update.message.reply_text("❌ အရင်ဆုံး /start နှိပ်ပါ။")
-        return
-
-    balance = user_data.get("balance", 0)
-    orders = user_data.get("orders", [])
-    topups = user_data.get("topups", [])
-    total_orders = len(orders)
-    total_topups = len(topups)
-
-    pending_topups_count = sum(1 for topup in topups if topup.get("status") == "pending")
-    pending_amount = sum(topup.get("amount", 0) for topup in topups if topup.get("status") == "pending")
-    
-    name = user_data.get('name', 'Unknown').replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '')
-    username = user_data.get('username', 'None').replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '')
-
-    status_msg = ""
-    if pending_topups_count > 0:
-        status_msg = f"\n⏳ ***Pending Topups***: {pending_topups_count} ခု ({pending_amount:,} MMK)\n❗ ***Diamond order ထားလို့မရပါ။ Admin approve စောင့်ပါ။***"
-
-    keyboard = [[InlineKeyboardButton("💳 ငွေဖြည့်မယ်", callback_data="topup_button")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    balance_text = (
-        f"💳 ***သင့်ရဲ့ Account အချက်အလက်များ***\n\n"
-        f"💰 ***လက်ကျန်ငွေ***: `{balance:,} MMK`\n"
-        f"📦 ***စုစုပေါင်း အော်ဒါများ***: {total_orders}\n"
-        f"💳 ***စုစုပေါင်း ငွေဖြည့်မှုများ***: {total_topups}{status_msg}\n\n"
-        f"***👤 နာမည်***: {name}\n"
-        f"***🆔 Username***: @{username}"
-    )
+    kb=[[InlineKeyboardButton("💳 ငွေဖြည့်", callback_data="topup_button")]]; markup=InlineKeyboardMarkup(kb)
+    bal_txt = (f"💳 ***Account Info***\n💰 Balance: `{bal:,} MMK`\n📦 Orders: {orders_n}\n💳 Topups: {topups_n}{st_msg}\n\n👤 Name: {name}\n🆔 Username: {un_disp}")
 
     try:
-        user_photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
-        if user_photos.total_count > 0:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id, photo=user_photos.photos[0][0].file_id,
-                caption=balance_text, parse_mode="Markdown", reply_markup=reply_markup
-            )
-        else:
-            await update.message.reply_text(balance_text, parse_mode="Markdown", reply_markup=reply_markup)
-    except Exception:
-        await update.message.reply_text(balance_text, parse_mode="Markdown", reply_markup=reply_markup)
+        photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
+        if photos.total_count > 0: await context.bot.send_photo(chat_id=update.effective_chat.id, photo=photos.photos[0][0].file_id, caption=bal_txt, parse_mode="Markdown", reply_markup=markup)
+        else: await update.message.reply_text(bal_txt, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e: print(f"Err balance photo {user_id}: {e}"); await update.message.reply_text(bal_txt, parse_mode="Markdown", reply_markup=markup)
 
 async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-
-    await load_bot_config()
-
-    if not is_user_authorized(user_id) or await check_maintenance_mode("topups"):
-        # ... (Unauthorized/Maintenance message code) ...
-        return
-
-    if user_id in user_states and user_states[user_id] == "waiting_approval":
-        # ... (Restricted message code) ...
-        return
-
-    if await check_pending_topup(user_id) or user_id in pending_topups:
-        await send_pending_topup_warning(update)
-        return
+    if not is_user_authorized(user_id): kb=[[InlineKeyboardButton("👑 Owner",url=f"tg://user?id={ADMIN_ID}")]]; await update.message.reply_text("🚫 သုံးခွင့်မရှိပါ။",reply_markup=InlineKeyboardMarkup(kb)); return
+    if not await check_maintenance_mode("topups"): await send_maintenance_message(update, "topups"); return
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("⏳ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if await check_pending_topup(user_id): await send_pending_topup_warning(update); return
+    if user_id in pending_topups: await update.message.reply_text("⏳ ***Topup ဆက်လုပ်ပါ!***",parse_mode="Markdown"); return
 
     args = context.args
-    if len(args) != 1:
-        # ... (Error message code) ...
-        return
-
+    if len(args) != 1: await update.message.reply_text("❌ Format: `/topup <amount>`\nဥပမာ: `/topup 10000`\n💡 Min: 1,000",parse_mode="Markdown"); return
     try:
         amount = int(args[0])
-        if amount < 1000:
-            # ... (Amount too low message code) ...
-            return
-    except ValueError:
-        # ... (Invalid amount message code) ...
-        return
+        if amount < 1000: await update.message.reply_text("❌ ***Amount နည်းလွန်း!***\n💰 ***Min: 1,000 MMK***",parse_mode="Markdown"); return
+    except ValueError: await update.message.reply_text("❌ ***Amount မှား!***\n💰 ***ဂဏန်းသာ ရေးပါ။***",parse_mode="Markdown"); return
 
     pending_topups[user_id] = {"amount": amount, "timestamp": datetime.now().isoformat()}
-
-    keyboard = [
-        [InlineKeyboardButton("📱 KBZ Pay", callback_data=f"topup_pay_kpay_{amount}")],
-        [InlineKeyboardButton("📱 Wave Money", callback_data=f"topup_pay_wave_{amount}")],
-        [InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data="topup_cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"💳 ***ငွေဖြည့်လုပ်ငန်းစဉ်***\n\n"
-        f"***✅ ပမာဏ***: `{amount:,} MMK`\n\n"
-        f"***အဆင့် 1***: Payment method ရွေးချယ်ပါ\n\n"
-        f"***⬇️ ငွေလွှဲမည့် app ရွေးချယ်ပါ***:\n\n"
-        f"***ℹ️ ပယ်ဖျက်ရန်*** /cancel ***နှိပ်ပါ***",
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
-
-async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-
-    await load_bot_config()
-
-    if not is_user_authorized(user_id) or user_id in user_states or user_id in pending_topups or await check_pending_topup(user_id):
-        # ... (Unauthorized/Restricted message code) ...
-        return
-
-    custom_prices = PRICES
-    # ... (Default prices definition)
-    default_prices = {
-        "wp1": 6000, "wp2": 12000, "wp3": 18000, "wp4": 24000, "wp5": 30000,
-        "wp6": 36000, "wp7": 42000, "wp8": 48000, "wp9": 54000, "wp10": 60000,
-        "11": 950, "22": 1900, "33": 2850, "56": 4200, "86": 5100, "112": 8200,
-        "172": 10200, "257": 15300, "343": 20400, "429": 25500, "514": 30600,
-        "600": 35700, "706": 40800, "878": 51000, "963": 56100, "1049": 61200,
-        "1135": 66300, "1412": 81600, "2195": 122400, "3688": 204000,
-        "5532": 306000, "9288": 510000, "12976": 714000,
-        "55": 3500, "165": 10000, "275": 16000, "565": 33000
-    }
-
-    current_prices = {**default_prices, **custom_prices}
-    price_msg = "💎 ***MLBB Diamond ဈေးနှုန်းများ***\n\n"
-    # ... (Price message generation code)
-
-    await update.message.reply_text(price_msg, parse_mode="Markdown")
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (Unchanged logic)
-    user_id = str(update.effective_user.id)
-    await load_bot_config()
-    if not is_user_authorized(user_id): return
-    
-    if user_id in pending_topups:
-        del pending_topups[user_id]
-        await update.message.reply_text("✅ ***ငွေဖြည့်ခြင်း ပယ်ဖျက်ပါပြီ!***", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("***ℹ️ လက်ရှိ ငွေဖြည့်မှု လုပ်ငန်းစဉ် မရှိပါ။***", parse_mode="Markdown")
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-
-    await load_bot_config()
-
-    if not is_user_authorized(user_id) or user_id in user_states or user_id in pending_topups or await check_pending_topup(user_id):
-        # ... (Unauthorized/Restricted message code) ...
-        return
-
-    user_data = await get_user_data_db(user_id)
-
-    if not user_data:
-        await update.message.reply_text("❌ အရင်ဆုံး /start နှိပ်ပါ။")
-        return
-
-    orders = user_data.get("orders", [])
-    topups = user_data.get("topups", [])
-
-    if not orders and not topups:
-        await update.message.reply_text("📋 သင့်မှာ မည်သည့် မှတ်တမ်းမှ မရှိသေးပါ။")
-        return
-        
-    # ... (History message generation code - uses DB data)
-    msg = "📋 သင့်ရဲ့ မှတ်တမ်းများ\n\n"
-    if orders:
-        msg += "🛒 ***အော်ဒါများ (နောက်ဆုံး 5 ခု)***:\n"
-        for order in orders[-5:]:
-            status_emoji = "✅" if order.get("status") == "confirmed" else "⏳"
-            msg += f"{status_emoji} {order['order_id']} - {order['amount']} ({order['price']:,} MMK)\n"
-        msg += "\n"
-    if topups:
-        msg += "💳 ***ငွေဖြည့်များ (နောက်ဆုံး 5 ခု)***:\n"
-        for topup in topups[-5:]:
-            status_emoji = "✅" if topup.get("status") == "approved" else "⏳"
-            msg += f"{status_emoji} {topup['amount']:,} MMK - {topup.get('timestamp', 'Unknown')[:10]}\n"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ... (Admin commands: approve, deduct, addadm, unadm, setprice, maintenance စသည်တို့ကို DB integrated ပြုလုပ်ထားပြီးဖြစ်သည်။)
-
-async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (DB integrated approve logic)
-    user_id = str(update.effective_user.id)
-    admin_name = f"{update.effective_user.first_name} {update.effective_user.last_name or ''}".strip()
-    if not is_admin(user_id): return
-    args = context.args
-    if len(args) != 2: return 
-    try:
-        target_user_id = args[0]
-        amount = int(args[1])
-    except ValueError: return 
-
-    global users_col
-    if users_col is None: return
-
-    try:
-        # Atomically find pending topup with matching amount, update status, and update balance
-        result = await asyncio.to_thread(users_col.update_one,
-            {"_id": target_user_id, "topups": {"$elemMatch": {"status": "pending", "amount": amount}}},
-            {"$set": {"topups.$.status": "approved", 
-                      "topups.$.approved_by": admin_name, 
-                      "topups.$.approved_at": datetime.now().isoformat()},
-             "$inc": {"balance": amount}}
-        )
-
-        if result.modified_count == 0:
-            await update.message.reply_text("❌ User မတွေ့ရှိပါ သို့မဟုတ် Pending Topup မရှိပါ (ပမာဏ မှားနေနိုင်သည်)!")
-            return
-
-        if target_user_id in user_states: del user_states[target_user_id]
-        
-        user_balance = await get_user_balance_db(target_user_id)
-        
-        # Notify user (Simplified)
-        try:
-            await context.bot.send_message(chat_id=int(target_user_id), 
-                                           text=f"✅ ***ငွေဖြည့်မှု အတည်ပြုပါပြီ!*** 🎉\n\n"
-                                                f"💰 ***ပမာဏ:*** `{amount:,} MMK`\n"
-                                                f"💳 ***လက်ကျန်ငွေ:*** `{user_balance:,} MMK`", 
-                                           parse_mode="Markdown")
-        except: pass
-        
-        # Confirm to admin
-        await update.message.reply_text(
-            f"✅ ***Approve အောင်မြင်ပါပြီ!***\n\n"
-            f"💳 ***User's new balance:*** `{user_balance:,} MMK`\n",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Database Error: {e}")
-
-async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if not is_admin(user_id): return
-    args = context.args
-    if len(args) != 2: return 
-
-    item = args[0]
-    try:
-        price = int(args[1])
-        if price < 0: return
-    except ValueError: return 
-
-    global PRICES
-    PRICES[item] = price
-    success = await save_bot_config_field_async("prices", PRICES) # Async Save
-    
-    if not success:
-        await update.message.reply_text("❌ ဈေးနှုန်း Database သို့ မသိမ်းနိုင်ပါ။")
-        return
-
-    await update.message.reply_text(f"✅ ***ဈေးနှုန်း ပြောင်းလဲပါပြီ!***\n\n"
-                                    f"💎 Item: `{item}`\n"
-                                    f"💰 New Price: `{price:,} MMK`\n", parse_mode="Markdown")
-
-
-# ... (Other admin commands can be integrated similarly, e.g., setkpaynum)
-async def setkpaynum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if not is_admin(user_id): return
-    args = context.args
-    if len(args) != 1: return 
-
-    new_number = args[0]
-    global payment_info
-    payment_info["kpay_number"] = new_number
-
-    success = await save_bot_config_field_async("payment_info", payment_info)
-    if not success:
-        await update.message.reply_text("❌ KPay နံပါတ် Database သို့ မသိမ်းနိုင်ပါ။")
-        return
-
-    await update.message.reply_text(
-        f"✅ ***KPay နံပါတ် ပြောင်းလဲပါပြီ!***\n\n"
-        f"📱 ***အသစ်:*** `{new_number}`\n\n",
-        parse_mode="Markdown"
-    )
-# ... (End of setkpaynum_command)
-
-# --- Message and Callback Handlers (DB Integrated) ---
+    kb = [[InlineKeyboardButton("📱 KBZ Pay", callback_data=f"topup_pay_kpay_{amount}")],[InlineKeyboardButton("📱 Wave Money", callback_data=f"topup_pay_wave_{amount}")],[InlineKeyboardButton("❌ Cancel", callback_data="topup_cancel")]]
+    markup=InlineKeyboardMarkup(kb)
+    await update.message.reply_text(f"💳 ***ငွေဖြည့်***\n✅ Amount: `{amount:,} MMK`\n***⬇️ Payment app ရွေးပါ***:\nℹ️ /cancel", parse_mode="Markdown", reply_markup=markup)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    if not is_user_authorized(user_id): return
+    if not is_payment_screenshot(update): await update.message.reply_text("❌ ***Screenshot သာ လက်ခံသည်။***", parse_mode="Markdown"); return
+    if user_id not in pending_topups: await update.message.reply_text("❌ ***Topup process မရှိ!***\n🔄 `/topup amount` သုံးပါ။", parse_mode="Markdown"); return
 
-    await load_bot_config()
-
-    if not is_user_authorized(user_id) or not is_payment_screenshot(update) or user_id not in pending_topups:
-        # ... (Error/Ignored message code) ...
-        return
-
-    pending = pending_topups[user_id]
-    amount = pending["amount"]
+    pending = pending_topups[user_id]; amount = pending["amount"]
     payment_method = pending.get("payment_method", "Unknown")
-
-    if payment_method == "Unknown":
-        # ... (Error message code) ...
-        return
+    if payment_method == "Unknown": await update.message.reply_text("❌ ***Payment app အရင်ရွေးပါ!***", parse_mode="Markdown"); return
 
     user_states[user_id] = "waiting_approval"
-
-    # --- DB Call: Save Topup Request ---
-    topup_id = f"TOP{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id[-4:]}"
-
-    topup_request = {
-        "topup_id": topup_id,
-        "amount": amount,
-        "payment_method": payment_method,
-        "status": "pending",
-        "timestamp": datetime.now().isoformat()
-    }
-
-    try:
-        await asyncio.to_thread(users_col.update_one, 
-            {"_id": user_id},
-            {"$push": {"topups": topup_request}}
-        )
-    except Exception as e:
-        print(f"Error saving topup request to DB: {e}")
-        await update.message.reply_text("❌ Database Error ကြောင့် ငွေဖြည့်မှု မအောင်မြင်ပါ။")
-        del pending_topups[user_id]
-        if user_id in user_states: del user_states[user_id]
-        return
-
-
-    # --- Notify Admin with Photo and Buttons ---
+    topup_id = f"TOP{datetime.now().strftime('%y%m%d%H%M')}{user_id[-3:]}"
     user_name = f"{update.effective_user.first_name} {update.effective_user.last_name or ''}".strip()
-    admin_msg = (f"💳 ***ငွေဖြည့်တောင်းဆိုမှု***\n\n"
-                 f"👤 User: [{user_name}](tg://user?id={user_id})\n"
-                 f"🆔 User ID: `{user_id}`\n"
-                 f"💰 Amount: `{amount:,} MMK`\n"
-                 f"🔖 Topup ID: `{topup_id}`\n")
-                 
-    keyboard = [[InlineKeyboardButton("✅ Approve", callback_data=f"topup_approve_{topup_id}"),
-                 InlineKeyboardButton("❌ Reject", callback_data=f"topup_reject_{topup_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    for admin_id in ADMIN_IDS:
+    topup_data = {"topup_id": topup_id, "amount": amount, "payment_method": payment_method, "status": "pending", "timestamp": datetime.now().isoformat(), "screenshot_file_id": update.message.photo[-1].file_id, "chat_id": update.effective_chat.id }
+    ud = get_user_data(user_id)
+    if not ud: update_user_data(user_id, {"name": user_name, "username": update.effective_user.username or "-", "balance": 0, "orders": [], "topups": []}) # Ensure user exists
+
+    if not add_to_user_list(user_id, "topups", topup_data):
+        print(f"❌ DB save fail topup {topup_id} user {user_id}."); await update.message.reply_text("❌ DB Error! Admin ကို ဆက်သွယ်ပါ။")
+        if user_id in user_states: del user_states[user_id]; return
+
+    admin_msg = (f"💳 ***Topup Request***\n👤 [{user_name}](tg://user?id={user_id}) (`{user_id}`)\n💰 `{amount:,} MMK` ({payment_method.upper()})\n🔖 ID: `{topup_id}`\n📊 ⏳ Pending\n***Screenshot စစ်ပါ။***")
+    kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"topup_approve_{topup_id}"), InlineKeyboardButton("❌ Reject", callback_data=f"topup_reject_{topup_id}")]]
+    markup=InlineKeyboardMarkup(kb); photo_id = update.message.photo[-1].file_id
+    admins = get_admins(); asyncio.gather(*[context.bot.send_photo(chat_id=aid, photo=photo_id, caption=admin_msg, parse_mode="Markdown", reply_markup=markup) for aid in admins])
+
+    if ADMIN_GROUP_ID:
         try:
-            await context.bot.send_photo(chat_id=admin_id, photo=update.message.photo[-1].file_id, 
-                                         caption=admin_msg, parse_mode="Markdown", reply_markup=reply_markup)
-        except Exception: pass
-    
+            if await is_bot_admin_in_group(context.bot, ADMIN_GROUP_ID):
+                gmsg = (f"💳 ***Topup!***\n👤 [{user_name}](tg://user?id={user_id})\n💰 `{amount:,} MMK` ({payment_method.upper()})\n🔖 `{topup_id}`\n📊 ⏳ Pending\n`/approve {user_id} {amount}`\n#TopupRequest")
+                await context.bot.send_photo(chat_id=ADMIN_GROUP_ID, photo=photo_id, caption=gmsg, parse_mode="Markdown", reply_markup=markup)
+        except Exception as e: print(f"Fail send topup photo group {ADMIN_GROUP_ID}: {e}")
+
     del pending_topups[user_id]
+    await update.message.reply_text(f"✅ ***Screenshot OK!***\n💰 `{amount:,} MMK`\n\n🔒 ***ကန့်သတ်ပါ***\n❌ ***Admin approve မလုပ်မချင်း သုံးမရပါ။***\n⏰ ***Admin စစ်ဆေးပြီး approve လုပ်ပါမည်။***", parse_mode="Markdown")
 
-    await update.message.reply_text(
-        f"✅ ***Screenshot လက်ခံပါပြီ!***\n\n"
-        f"💰 ***ပမာဏ:*** `{amount:,} MMK`\n"
-        "🔒 ***အသုံးပြုမှု ယာယီ ကန့်သတ်ပါ***\n"
-        "❌ ***Admin က လက်ခံပြီးကြောင်း အတည်ပြုတဲ့အထိ Commands အသုံးပြုလို့ မရပါ။***\n",
-        parse_mode="Markdown"
-    )
-
-async def handle_restricted_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    await load_bot_config()
+    if not is_user_authorized(user_id): kb=[[InlineKeyboardButton("👑 Owner",url=f"tg://user?id={ADMIN_ID}")]]; await update.message.reply_text("🚫 သုံးခွင့်မရှိပါ။",reply_markup=InlineKeyboardMarkup(kb)); return
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("⏳ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if user_id in pending_topups: await update.message.reply_text("⏳ ***Topup ဆက်လုပ်ပါ။***",parse_mode="Markdown"); return
+    if await check_pending_topup(user_id): await send_pending_topup_warning(update); return
 
-    if not is_user_authorized(user_id):
-        if update.message.text:
-            reply = simple_reply(update.message.text)
-            await update.message.reply_text(reply, parse_mode="Markdown")
+    user_data = get_user_data(user_id)
+    if not user_data: await update.message.reply_text("❌ /start ကို အရင်နှိပ်ပါ။"); return
+    orders = user_data.get("orders", []); topups = user_data.get("topups", [])
+    if not orders and not topups: await update.message.reply_text("📋 မှတ်တမ်း မရှိသေးပါ။"); return
+
+    msg = "📋 ***နောက်ဆုံး မှတ်တမ်းများ***\n\n"; limit = 5
+    if orders:
+        msg += f"🛒 ***Orders (Last {limit}):***\n"
+        for o in orders[-limit:]:
+            st=o.get("status","?"); em="✅" if st=="confirmed" else ("❌" if st=="cancelled" else "⏳")
+            ts=o.get('timestamp',''); dt=datetime.fromisoformat(ts).strftime('%y-%m-%d') if ts else '?'
+            msg += f"{em} `{o.get('order_id','?')}` ({o.get('amount','?')} dia) {o.get('price',0):,} MMK [{dt}]\n"
+        msg += "\n"
+    if topups:
+        msg += f"💳 ***Topups (Last {limit}):***\n"
+        for t in topups[-limit:]:
+            st=t.get("status","?"); em="✅" if st=="approved" else ("❌" if st=="rejected" else "⏳")
+            ts=t.get('timestamp',''); dt=datetime.fromisoformat(ts).strftime('%y-%m-%d') if ts else '?'
+            msg += f"{em} {t.get('amount',0):,} MMK ({t.get('payment_method','?').upper()}) [{dt}]\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_user_authorized(user_id): kb=[[InlineKeyboardButton("👑 Owner",url=f"tg://user?id={ADMIN_ID}")]]; await update.message.reply_text("🚫 သုံးခွင့်မရှိပါ။",reply_markup=InlineKeyboardMarkup(kb)); return
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("⏳ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if user_id in pending_topups: await update.message.reply_text("⏳ ***Topup ဆက်လုပ်ပါ။***",parse_mode="Markdown"); return
+
+    custom_prices = load_prices()
+    default_prices = { "wp1": 6000, "wp2": 12000, "wp3": 18000, "wp4": 24000, "wp5": 30000, "wp6": 36000, "wp7": 42000, "wp8": 48000, "wp9": 54000, "wp10": 60000, "11": 950, "22": 1900, "33": 2850, "56": 4200, "86": 5100, "112": 8200, "172": 10200, "257": 15300, "343": 20400, "429": 25500, "514": 30600, "600": 35700, "706": 40800, "878": 51000, "963": 56100, "1049": 61200, "1135": 66300, "1412": 81600, "2195": 122400, "3688": 204000, "5532": 306000, "9288": 510000, "12976": 714000, "55": 3500, "165": 10000, "275": 16000, "565": 33000 }
+    current_prices = {**default_prices, **custom_prices}
+
+    price_msg = "💎 ***MLBB ဈေးနှုန်းများ***\n\n🎟️ ***Weekly Pass***:\n"
+    for i in range(1, 11): wpk = f"wp{i}"; price_msg += f"• {wpk} = {current_prices.get(wpk, 'N/A'):,} MMK\n" if wpk in current_prices else ""
+    price_msg += "\n💎 ***Regular Diamonds***:\n"
+    reg_dia = ["11","22","33","56","86","112","172","257","343","429","514","600","706","878","963","1049","1135","1412","2195","3688","5532","9288","12976"]
+    for d in reg_dia: price_msg += f"• {d} = {current_prices.get(d, 'N/A'):,} MMK\n" if d in current_prices else ""
+    price_msg += "\n💎 ***2X Pass***:\n"
+    dx_dia = ["55", "165", "275", "565"]
+    for d in dx_dia: price_msg += f"• {d} = {current_prices.get(d, 'N/A'):,} MMK\n" if d in current_prices else ""
+    other_customs = {k: v for k, v in custom_prices.items() if k not in default_prices}
+    if other_customs: price_msg += "\n🔥 ***Special Items***:\n"; for item, price in other_customs.items(): price_msg += f"• {item} = {price:,} MMK\n"
+    price_msg += "\n📝 `/mmb gameid serverid amount`\nဥပမာ:\n`/mmb 123 12 wp1`"
+    await update.message.reply_text(price_msg, parse_mode="Markdown")
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_user_authorized(user_id): return
+    if user_id in pending_topups: del pending_topups[user_id]; await update.message.reply_text("✅ ***ငွေဖြည့်ခြင်း ပယ်ဖျက်!***", parse_mode="Markdown")
+    else: await update.message.reply_text("ℹ️ ***Pending ငွေဖြည့်မှု မရှိပါ။***", parse_mode="Markdown")
+
+async def c_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id in user_states and user_states[user_id]=="waiting_approval": return await update.message.reply_text("❌ Admin approve စောင့်ပါ။",parse_mode="Markdown")
+    args = context.args
+    if not args: return await update.message.reply_text("🧮 `/c <expression>`",parse_mode="Markdown")
+    expression = ''.join(args).replace(' ',''); pattern = r'^[0-9+\-*/().]+$'
+    if not re.match(pattern, expression) or not any(op in expression for op in ['+','-','*','/']): return await update.message.reply_text("❌ Invalid!",parse_mode="Markdown")
+    try: result = eval(expression); await update.message.reply_text(f"🧮 `{expression}` = ***{result:,}***",parse_mode="Markdown")
+    except ZeroDivisionError: await update.message.reply_text("❌ Zero ဖြင့် စားမရပါ။")
+    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user; req_user_id = str(user.id)
+    username = user.username or "-"; name = f"{user.first_name} {user.last_name or ''}".strip()
+    load_authorized_users()
+    if is_user_authorized(req_user_id): await update.message.reply_text("✅ သုံးခွင့်ရပြီးသား!", parse_mode="Markdown"); return
+    kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"register_approve_{req_user_id}"), InlineKeyboardButton("❌ Reject", callback_data=f"register_reject_{req_user_id}")]]
+    markup=InlineKeyboardMarkup(kb); username_display = f"@{username}" if username != "-" else "None"
+    owner_msg = (f"📝 ***Register Request***\n👤 [{name}](tg://user?id={req_user_id}) (`{req_user_id}`)\n📱 Username: {username_display}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n***Approve?***")
+    admins = get_admins(); sent_admins = 0; photo_id = None
+    try: photos = await context.bot.get_user_profile_photos(user_id=int(req_user_id), limit=1); photo_id = photos.photos[0][0].file_id if photos.total_count > 0 else None
+    except: pass
+    results = await asyncio.gather(*[context.bot.send_photo(chat_id=aid, photo=photo_id, caption=owner_msg, parse_mode="Markdown", reply_markup=markup) if photo_id else context.bot.send_message(chat_id=aid, text=owner_msg, parse_mode="Markdown", reply_markup=markup) for aid in admins], return_exceptions=True)
+    sent_admins = sum(1 for r in results if not isinstance(r, Exception)); failed_admins = len(admins) - sent_admins
+    if failed_admins > 0: print(f"⚠️ Failed send register req to {failed_admins} admins.")
+    user_confirm = (f"✅ ***Request ပို့ပြီး!***\n👤 {name}\n🆔 `{req_user_id}`\n⏳ ***Admin approve စောင့်ပါ ({sent_admins} notified)***")
+    try:
+        if photo_id: await update.message.reply_photo(photo=photo_id, caption=user_confirm, parse_mode="Markdown")
+        else: await update.message.reply_text(user_confirm, parse_mode="Markdown")
+    except Exception as e: print(f"Err confirm reg user {req_user_id}: {e}"); await update.message.reply_text(user_confirm, parse_mode="Markdown")
+
+# --- (Other Admin Handlers: done, reply, maintenance, testgroup, adminhelp) ---
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)): return await update.message.reply_text("❌ Admin မဟုတ်ပါ။")
+    args = context.args;
+    if len(args)!=1 or not args[0].isdigit(): return await update.message.reply_text("❌ Format: /done <user_id>")
+    target_user_id = int(args[0])
+    try: await context.bot.send_message(chat_id=target_user_id, text="🙏 ကျေးဇူးတင်ပါသည်!\n✅ Order Done! 🎉"); await update.message.reply_text("✅ User ထံ ပို့ပြီး။")
+    except Exception as e: await update.message.reply_text(f"❌ User ထံ မပို့နိုင်ပါ: {e}")
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)): return await update.message.reply_text("❌ Admin မဟုတ်ပါ။")
+    args = context.args;
+    if len(args)<2 or not args[0].isdigit(): return await update.message.reply_text("❌ Format: /reply <user_id> <message>")
+    target_user_id = int(args[0]); message = " ".join(args[1:])
+    try: await context.bot.send_message(chat_id=target_user_id, text=message); await update.message.reply_text("✅ Message ပို့ပြီး။")
+    except Exception as e: await update.message.reply_text(f"❌ Message မပို့နိုင်ပါ: {e}")
+
+async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id);
+    if not is_admin(user_id): return await update.message.reply_text("❌ Admin မဟုတ်ပါ။")
+    args = context.args
+    if len(args)!=2 or args[0].lower() not in ["orders","topups","general"] or args[1].lower() not in ["on","off"]: return await update.message.reply_text("❌ Format: /maintenance <orders|topups|general> <on|off>")
+    feature = args[0].lower(); status = args[1].lower() == "on"
+    bot_maintenance[feature] = status; s_txt = "🟢 On" if status else "🔴 Off"; f_txt = feature.capitalize()
+    await update.message.reply_text(f"✅ ***Maint Update!***\n🔧 {f_txt}\n📊 {s_txt}\n\n" f"Current: O:{'🟢' if bot_maintenance['orders'] else '🔴'} T:{'🟢' if bot_maintenance['topups'] else '🔴'} G:{'🟢' if bot_maintenance['general'] else '🔴'}", parse_mode="Markdown")
+
+async def testgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id);
+    if not is_admin(user_id): return await update.message.reply_text("❌ Admin မဟုတ်ပါ။")
+    if not ADMIN_GROUP_ID: return await update.message.reply_text("❌ Group ID မရှိပါ။")
+    is_admin_in_group = await is_bot_admin_in_group(context.bot, ADMIN_GROUP_ID)
+    try:
+        if is_admin_in_group: await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=f"✅ **Test OK**\n⏰ {datetime.now().strftime('%H:%M:%S')}", parse_mode="Markdown"); await update.message.reply_text(f"✅ **Group Test OK!**\n📱 `{ADMIN_GROUP_ID}`\n📨 ပို့ပြီး။", parse_mode="Markdown")
+        else: await update.message.reply_text(f"❌ **Group Fail!**\n📱 `{ADMIN_GROUP_ID}`\n🤖 Bot Admin မဟုတ်❌\n\n**ပြင်ရန်:**\n1️⃣ Add Bot\n2️⃣ Make Admin\n3️⃣ Allow Post", parse_mode="Markdown")
+    except Exception as e: await update.message.reply_text(f"❌ **Error!** Group: `{ADMIN_GROUP_ID}`\n⚠️ `{e}`\n\n**ဖြစ်နိုင်:**\n• Bot မရှိ\n• ID မှား\n• Permission မရှိ", parse_mode="Markdown")
+
+async def adminhelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id);
+    if not is_admin(user_id): return await update.message.reply_text("❌ Admin မဟုတ်ပါ။")
+    is_user_owner = is_owner(user_id)
+    help_msg = "🔧 *Admin Commands* 🔧\n\n"
+    if is_user_owner: help_msg += ("👑 *Owner Only:*\n• /addadm <id>\n• /unadm <id>\n• /ban <id>\n• /unban <id>\n• /broadcast ...\n• /addbot <token>\n• /removebot <id>\n• /addfund <admin_id> <amt>\n• /deductfund <admin_id> <amt>\n• /set*qr, /remove*qr\n\n")
+    help_msg += ("💰 *Balance:*\n• /approve <id> <amt>\n• /deduct <id> <amt>\n💬 *Comm:*\n• /reply <id> <msg>\n• /done <id>\n• /sendgroup <msg>\n🔧 *Settings:*\n• /maintenance ...\n• /setprice <item> <price>\n• /removeprice <item>\n• /set*num <num>\n• /set*name <name>\n\n"
+                 f"📊 *Status:*\n O:{'🟢' if bot_maintenance['orders'] else '🔴'} T:{'🟢' if bot_maintenance['topups'] else '🔴'} G:{'🟢' if bot_maintenance['general'] else '🔴'} | Auth:{len(AUTHORIZED_USERS)}\n\n"
+                 f"💳 *Payment:*\n W: {payment_info['wave_number']} ({payment_info['wave_name']})\n K: {payment_info['kpay_number']} ({payment_info['kpay_name']})")
+    await update.message.reply_text(help_msg, parse_mode="Markdown")
+
+
+# --- (Include report commands: daily, monthly, yearly - adapted) ---
+# Helper for report date filtering
+def filter_by_date_str(items, date_field, start_str, end_str):
+    filtered = []
+    len_compare = len(start_str) # Assume start and end have same format (YYYY or YYYY-MM or YYYY-MM-DD)
+    for item in items:
+        ts_str = item.get(date_field)
+        if ts_str and len(ts_str) >= len_compare:
+            date_part = ts_str[:len_compare]
+            if start_str <= date_part <= end_str:
+                filtered.append(item)
+    return filtered
+
+async def report_base_command(update: Update, context: ContextTypes.DEFAULT_TYPE, period_type: str):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id): return await update.message.reply_text("❌ Owner သာ ကြည့်နိုင်ပါ။")
+    args = context.args
+
+    if len(args) == 0:
+        # Show filter buttons (adapt based on period_type)
+        today = datetime.now()
+        if period_type == "day":
+             yesterday = today - timedelta(days=1); week_ago = today - timedelta(days=7)
+             kb = [[InlineKeyboardButton("📅 ဒီနေ့", callback_data=f"report_day_{today.strftime('%Y-%m-%d')}")],
+                   [InlineKeyboardButton("📅 မနေ့က", callback_data=f"report_day_{yesterday.strftime('%Y-%m-%d')}")],
+                   [InlineKeyboardButton(f"📅 {week_ago.strftime('%m/%d')}-{today.strftime('%m/%d')}", callback_data=f"report_day_range_{week_ago.strftime('%Y-%m-%d')}_{today.strftime('%Y-%m-%d')}")]]
+             prompt = "📊 ***ရက်စွဲ ရွေးပါ***\nFormat: `/d YYYY-MM-DD` or `/d START END`"
+        elif period_type == "month":
+             this_m = today.strftime("%Y-%m"); last_m = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+             m3_ago = (today.replace(day=1) - timedelta(days=90)).strftime("%Y-%m")
+             kb = [[InlineKeyboardButton("📅 ဒီလ", callback_data=f"report_month_{this_m}")],
+                   [InlineKeyboardButton("📅 போன மாதம்", callback_data=f"report_month_{last_m}")],
+                   [InlineKeyboardButton(f"📅 {m3_ago} မှ {this_m}", callback_data=f"report_month_range_{m3_ago}_{this_m}")]]
+             prompt = "📊 ***လ ရွေးပါ***\nFormat: `/m YYYY-MM` or `/m START END`"
+        else: # year
+             this_y = today.strftime("%Y"); last_y = str(int(this_y) - 1)
+             kb = [[InlineKeyboardButton("📅 ဒီနှစ်", callback_data=f"report_year_{this_y}")],
+                   [InlineKeyboardButton("📅 போன வருடம்", callback_data=f"report_year_{last_y}")],
+                   [InlineKeyboardButton(f"📅 {last_y} & {this_y}", callback_data=f"report_year_range_{last_y}_{this_y}")]]
+             prompt = "📊 ***နှစ် ရွေးပါ***\nFormat: `/y YYYY` or `/y START END`"
+        await update.message.reply_text(prompt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)); return
+
+    elif len(args) == 1: start_str = end_str = args[0]
+    elif len(args) == 2: start_str, end_str = args[0], args[1]
+    else: return await update.message.reply_text(f"❌ Format မှား!\n/{period_type[0]} YYYY... [END_YYYY...]")
+
+    # Validate date string format roughly based on expected length
+    len_expected = 10 if period_type=="day" else (7 if period_type=="month" else 4)
+    if len(start_str) != len_expected or len(end_str) != len_expected:
+        return await update.message.reply_text(f"❌ Date format မှား! ({'YYYY-MM-DD' if period_type=='day' else ('YYYY-MM' if period_type=='month' else 'YYYY')})")
+
+    period_text = f"{period_type.capitalize()} ({start_str}{f' မှ {end_str}' if start_str != end_str else ''})"
+
+    total_sales = 0; total_orders = 0; total_topups = 0; topup_count = 0
+    if users_col is None: return await update.message.reply_text("❌ DB conn error.")
+    try:
+        all_users = users_col.find({})
+        for user_data in all_users:
+            confirmed_orders = [o for o in user_data.get("orders",[]) if o.get("status")=="confirmed"]
+            filtered_orders = filter_by_date_str(confirmed_orders, "confirmed_at", start_str, end_str)
+            for order in filtered_orders: total_sales += order.get("price",0); total_orders += 1
+
+            approved_topups = [t for t in user_data.get("topups",[]) if t.get("status")=="approved"]
+            filtered_topups = filter_by_date_str(approved_topups, "approved_at", start_str, end_str)
+            for topup in filtered_topups: total_topups += topup.get("amount",0); topup_count += 1
+    except Exception as e: print(f"❌ Report error: {e}"); return await update.message.reply_text("❌ Report error.")
+
+    await update.message.reply_text(f"📊 ***Report***\n📅 ကာလ: {period_text}\n\n🛒 ***Orders Confirmed***:\n💰 `{total_sales:,} MMK` ({total_orders} ခု)\n\n💳 ***Topups Approved***:\n💰 `{total_topups:,} MMK` ({topup_count} ခု)", parse_mode="Markdown")
+
+async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await report_base_command(update, context, "day")
+async def monthly_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await report_base_command(update, context, "month")
+async def yearly_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await report_base_command(update, context, "year")
+
+
+# --- (Include clone bot commands: addbot, listbots, removebot, addfund, deductfund - adapted) ---
+async def addbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id=str(update.effective_user.id);
+    if not is_admin(user_id): return await update.message.reply_text("❌ Admin Only!")
+    args=context.args;
+    if len(args)!=1: return await update.message.reply_text("❌ Format: /addbot <token>")
+    bot_token=args[0]
+    try:
+        temp_bot=Bot(token=bot_token); bot_info=await temp_bot.get_me(); bot_un=bot_info.username; bot_id=str(bot_info.id)
+        existing=load_clone_bots_db();
+        if bot_id in existing: return await update.message.reply_text(f"ℹ️ Bot @{bot_un} ရှိပြီးသား!")
+        bot_data={"token":bot_token,"username":bot_un,"owner_id":user_id,"balance":0,"status":"active","created_at":datetime.now().isoformat()}
+        if save_clone_bot_db(bot_id, bot_data):
+            asyncio.create_task(run_clone_bot(bot_token, bot_id, user_id))
+            await update.message.reply_text(f"✅ Bot @{bot_un} Added & Running!\nID: `{bot_id}` Admin: `{user_id}`", parse_mode="Markdown")
+        else: await update.message.reply_text("❌ DB Error!")
+    except Exception as e: await update.message.reply_text(f"❌ Token မှား/Error: {e}")
+
+async def listbots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id=str(update.effective_user.id);
+    if not is_admin(user_id): return await update.message.reply_text("❌ Admin Only!")
+    bots=load_clone_bots_db();
+    if not bots: return await update.message.reply_text("ℹ️ Clone bots မရှိပါ။")
+    msg="🤖 ***Clone Bots List***\n\n";
+    for bid, bdata in bots.items():
+        st_ic="🟢" if bdata.get("status")=="active" else "🔴"; cr_str=bdata.get('created_at','?');
+        try: cr_d=datetime.fromisoformat(cr_str).strftime('%Y-%m-%d')
+        except: cr_d=cr_str
+        msg+=(f"{st_ic} @{bdata.get('username','?')}\n├ ID: `{bid}`\n├ Admin: `{bdata.get('owner_id','?')}`\n├ Bal: {bdata.get('balance',0):,} MMK\n└ Created: {cr_d}\n\n")
+    msg+=f"📊 Total: {len(bots)} bots"; await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def removebot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id=str(update.effective_user.id);
+    if not is_owner(user_id): return await update.message.reply_text("❌ Owner Only!")
+    args=context.args;
+    if len(args)!=1: return await update.message.reply_text("❌ Format: /removebot <bot_id>")
+    bot_id=args[0]
+    if remove_clone_bot_db(bot_id):
+        if bot_id in clone_bot_apps:
+            try: app=clone_bot_apps[bot_id]; await app.updater.stop(); await app.stop(); await app.shutdown(); del clone_bot_apps[bot_id]; print(f"✅ Clone bot {bot_id} stopped.")
+            except Exception as e: print(f"⚠️ Error stopping clone {bot_id}: {e}"); if bot_id in clone_bot_apps: del clone_bot_apps[bot_id]
+        await update.message.reply_text(f"✅ Bot (`{bot_id}`) ဖျက်ပြီး။")
+    else: await update.message.reply_text(f"❌ Bot ID `{bot_id}` မတွေ့/မဖျက်နိုင်ပါ။")
+
+async def addfund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id=str(update.effective_user.id);
+    if not is_owner(user_id): return await update.message.reply_text("❌ Owner Only!")
+    args=context.args;
+    if len(args)!=2: return await update.message.reply_text("❌ Format: /addfund <admin_id> <amount>")
+    admin_id_str=args[0];
+    try: amount=int(args[1]);
+    except ValueError: return await update.message.reply_text("❌ Amount မှား!")
+    if amount<=0: return await update.message.reply_text("❌ Amount > 0 ဖြစ်ရမည်!")
+    bot_id_found, bot_found = get_clone_bot_by_admin(admin_id_str)
+    if not bot_found: return await update.message.reply_text(f"❌ Admin ID `{admin_id_str}` Bot မတွေ့ပါ။")
+    if update_clone_bot_balance(bot_id_found, amount):
+        nb = bot_found.get("balance",0)+amount
+        try: await context.bot.send_message(chat_id=admin_id_str, text=(f"💰 Balance ဖြည့်ပြီး!\n✅ Owner က ဖြည့်ပေး!\n📥 Amount: `{amount:,}`\n💳 New Bal: `{nb:,}`\n🤖 Bot: @{bot_found.get('username','?')}"), parse_mode="Markdown")
+        except Exception as e: print(f"Fail notify clone admin {admin_id_str} addfund: {e}")
+        await update.message.reply_text(f"✅ Fund Added!\n👤 Admin: `{admin_id_str}`\n🤖 Bot: @{bot_found.get('username','?')}\n💰 Added: `{amount:,}`\n💳 New Bal: `{nb:,}`", parse_mode="Markdown")
+    else: await update.message.reply_text("❌ DB Error!")
+
+async def deductfund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id=str(update.effective_user.id);
+    if not is_owner(user_id): return await update.message.reply_text("❌ Owner Only!")
+    args=context.args;
+    if len(args)!=2: return await update.message.reply_text("❌ Format: /deductfund <admin_id> <amount>")
+    admin_id_str=args[0];
+    try: amount=int(args[1]);
+    except ValueError: return await update.message.reply_text("❌ Amount မှား!")
+    if amount<=0: return await update.message.reply_text("❌ Amount > 0 ဖြစ်ရမည်!")
+    bot_id_found, bot_found = get_clone_bot_by_admin(admin_id_str)
+    if not bot_found: return await update.message.reply_text(f"❌ Admin ID `{admin_id_str}` Bot မတွေ့ပါ။")
+    cb=bot_found.get("balance",0);
+    if cb<amount: return await update.message.reply_text(f"❌ Balance မလုံလောက်! လက်ကျန်: {cb:,}")
+    if update_clone_bot_balance(bot_id_found, -amount):
+        nb=cb-amount
+        try: await context.bot.send_message(chat_id=admin_id_str, text=(f"💸 Balance နှုတ်ပြီး!\n⚠️ Owner က နှုတ်!\n📤 Amount: `{amount:,}`\n💳 New Bal: `{nb:,}`\n🤖 Bot: @{bot_found.get('username','?')}"), parse_mode="Markdown")
+        except Exception as e: print(f"Fail notify clone admin {admin_id_str} deductfund: {e}")
+        await update.message.reply_text(f"✅ Fund Deducted!\n👤 Admin: `{admin_id_str}`\n🤖 Bot: @{bot_found.get('username','?')}\n💸 Deducted: `{amount:,}`\n💳 New Bal: `{nb:,}`", parse_mode="Markdown")
+    else: await update.message.reply_text("❌ DB Error!")
+
+
+# --- (Include Callback Handler: button_callback - adapted) ---
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    user_id = str(query.from_user.id); admin_name = query.from_user.first_name or "Admin"; data = query.data
+
+    # --- Payment Method Selection ---
+    if data.startswith("topup_pay_"):
+        parts = data.split("_"); payment_method = parts[2]; amount = int(parts[3])
+        if user_id not in pending_topups: return await query.message.reply_text("❌ Process หมดอายุ။ /topup ပြန်စပါ။")
+        pending_topups[user_id]["payment_method"] = payment_method
+        p_name = "KBZ Pay" if payment_method == "kpay" else "Wave Money"
+        p_num = payment_info['kpay_number'] if payment_method == "kpay" else payment_info['wave_number']
+        p_acc = payment_info['kpay_name'] if payment_method == "kpay" else payment_info['wave_name']
+        p_qr = payment_info.get('kpay_image') if payment_method == "kpay" else payment_info.get('wave_image')
+        if p_qr: try: await query.message.reply_photo(photo=p_qr, caption=f"📱 **{p_name} QR**\n📞 `{p_num}`\n👤 {p_acc}", parse_mode="Markdown") except Exception as e: print(f"Err QR: {e}")
+        await query.edit_message_text(f"💳 ***ငွေဖြည့်***\n✅ Amount: `{amount:,}`\n✅ Payment: {p_name}\n\n***အဆင့် 2: Screenshot တင်ပါ။***\n📱 {p_name}\n📞 `{p_num}`\n👤 {p_acc}\n\n⚠️ ***Note မှာ သင့် {p_name} နာမည် ရေးပါ။***\n💡 ***Screenshot ဒီမှာ တင်ပါ။***\nℹ️ /cancel", parse_mode="Markdown")
         return
 
-    if user_id in user_states and user_states[user_id] == "waiting_approval":
-        if update.message.photo:
-            await handle_photo(update, context)
+    # --- Registration Request Button ---
+    elif data == "request_register":
+        user = query.from_user; req_user_id = str(user.id); username = user.username or "-"; name = f"{user.first_name} {user.last_name or ''}".strip()
+        load_authorized_users()
+        if is_user_authorized(req_user_id): return await query.answer("✅ သုံးခွင့်ရပြီး!", show_alert=True)
+        kb=[[InlineKeyboardButton("✅ Approve",callback_data=f"register_approve_{req_user_id}"),InlineKeyboardButton("❌ Reject",callback_data=f"register_reject_{req_user_id}")]]
+        markup=InlineKeyboardMarkup(kb); un_disp=f"@{username}" if username!="-" else "None"
+        owner_msg=(f"📝 ***Register Request***\n👤 [{name}](tg://user?id={req_user_id}) (`{req_user_id}`)\n📱 {un_disp}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n***Approve?***")
+        admins=get_admins(); sent_admins=0; photo_id=None
+        try: photos=await context.bot.get_user_profile_photos(user_id=int(req_user_id),limit=1); photo_id=photos.photos[0][0].file_id if photos.total_count>0 else None
+        except: pass
+        results=await asyncio.gather(*[context.bot.send_photo(chat_id=aid,photo=photo_id,caption=owner_msg,parse_mode="Markdown",reply_markup=markup) if photo_id else context.bot.send_message(chat_id=aid,text=owner_msg,parse_mode="Markdown",reply_markup=markup) for aid in admins], return_exceptions=True)
+        sent_admins=sum(1 for r in results if not isinstance(r,Exception)); failed_admins=len(admins)-sent_admins
+        if failed_admins>0: print(f"⚠️ Fail send reg req to {failed_admins} admins.")
+        await query.answer("✅ Request ပို့ပြီး!", show_alert=True)
+        user_confirm=(f"✅ ***Request ပို့ပြီး!***\n👤 {name}\n🆔 `{req_user_id}`\n⏳ ***Admin approve စောင့်ပါ ({sent_admins} notified)***")
+        try: await query.edit_message_text(user_confirm, parse_mode="Markdown") # Edit the original button message
+        except Exception as e: print(f"Err edit reg confirm {req_user_id}: {e}"); await query.message.reply_text(user_confirm, parse_mode="Markdown") # Fallback
+        return
+
+    # --- Registration Approve/Reject ---
+    elif data.startswith("register_approve_"):
+        if not is_admin(user_id): return await query.answer("❌ Admin Only!", show_alert=True)
+        target_user_id = data.replace("register_approve_", ""); load_authorized_users()
+        if target_user_id in AUTHORIZED_USERS: await query.answer("ℹ️ Approve ပြီးသား!", show_alert=True); try: await query.edit_message_reply_markup(reply_markup=None) except: pass; return
+        AUTHORIZED_USERS.add(target_user_id)
+        if save_authorized_users():
+            if target_user_id in user_states: del user_states[target_user_id]
+            try: await query.edit_message_text(text=query.message.text + f"\n\n✅ Approved by {admin_name}", parse_mode="Markdown", reply_markup=None)
+            except: pass
+            try: await context.bot.send_message(chat_id=int(target_user_id), text="🎉 Approved!\n✅ Admin လက်ခံ။\n🚀 /start နှိပ်သုံးပါ။")
+            except Exception as e: print(f"Fail notify approved user {target_user_id}: {e}")
+            if ADMIN_GROUP_ID: try: ud=get_user_data(target_user_id); un=ud.get("name",target_user_id) if ud else target_user_id; if await is_bot_admin_in_group(context.bot, ADMIN_GROUP_ID): gmsg=(f"✅ Reg Approved!\n👤 [{un}](tg://user?id={target_user_id})\nBy: {admin_name}\n#RegApproved"); await context.bot.send_message(chat_id=ADMIN_GROUP_ID,text=gmsg,parse_mode="Markdown")
+            except Exception as e: print(f"Fail notify group reg approve: {e}")
+            await query.answer("✅ User approved!", show_alert=True)
+        else: AUTHORIZED_USERS.discard(target_user_id); await query.answer("❌ DB Error!", show_alert=True)
+        return
+
+    elif data.startswith("register_reject_"):
+        if not is_admin(user_id): return await query.answer("❌ Admin Only!", show_alert=True)
+        target_user_id = data.replace("register_reject_", "")
+        try: await query.edit_message_text(text=query.message.text + f"\n\n❌ Rejected by {admin_name}", parse_mode="Markdown", reply_markup=None)
+        except: pass
+        try: await context.bot.send_message(chat_id=int(target_user_id), text="❌ Registration Rejected\n📞 Admin ကို ဆက်သွယ်ပါ။")
+        except Exception as e: print(f"Fail notify rejected user {target_user_id}: {e}")
+        if ADMIN_GROUP_ID: try: ud=get_user_data(target_user_id); un=ud.get("name",target_user_id) if ud else target_user_id; if await is_bot_admin_in_group(context.bot, ADMIN_GROUP_ID): gmsg=(f"❌ Reg Rejected!\n👤 [{un}](tg://user?id={target_user_id})\nBy: {admin_name}\n#RegRejected"); await context.bot.send_message(chat_id=ADMIN_GROUP_ID,text=gmsg,parse_mode="Markdown")
+        except Exception as e: print(f"Fail notify group reg reject: {e}")
+        await query.answer("❌ User rejected!", show_alert=True)
+        return
+
+    # --- Topup Cancel ---
+    elif data == "topup_cancel":
+        if user_id in pending_topups: del pending_topups[user_id]
+        await query.edit_message_text("✅ ***ငွေဖြည့်ခြင်း ပယ်ဖျက်!***", parse_mode="Markdown"); return
+
+    # --- Topup Approve/Reject Buttons ---
+    elif data.startswith("topup_approve_") or data.startswith("topup_reject_"):
+        if not is_admin(user_id): return await query.answer("❌ Admin မဟုတ်ပါ။")
+        is_approve = data.startswith("topup_approve_")
+        topup_id = data.replace("topup_approve_", "").replace("topup_reject_", "")
+        update_fields = {"status": "approved" if is_approve else "rejected", f"{'approved' if is_approve else 'rejected'}_by": admin_name, f"{'approved' if is_approve else 'rejected'}_at": datetime.now().isoformat()}
+        target_user_id, topup_amount, status_before = find_and_update_topup_mongo(topup_id, update_fields)
+
+        if target_user_id is None:
+            if status_before is not None and status_before == ("approved" if is_approve else "rejected"): await query.answer("⚠️ လုပ်ဆောင်ပြီးသား။"); try: await query.edit_message_reply_markup(reply_markup=None) except: pass
+            else: await query.answer("❌ Topup မတွေ့/Update မရ။")
             return
 
-        await update.message.reply_text(
-            "❌ ***အသုံးပြုမှု ကန့်သတ်ထားပါ!***\n\n"
-            "🔒 ***Screenshot ပို့ပြီးပါပြီ။ Admin က လက်ခံပြီးကြောင်း အတည်ပြုတဲ့အထိ Commands အသုံးပြုလို့ မရပါ။***\n",
-            parse_mode="Markdown"
-        )
-        return
-
-    if update.message.text:
-        reply = simple_reply(update.message.text.strip())
-        await update.message.reply_text(reply, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            "📱 ***MLBB Diamond Top-up Bot***\n\n"
-            "💎 Diamond ဝယ်ယူရန် /mmb command သုံးပါ\n",
-            parse_mode="Markdown"
-        )
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = str(query.from_user.id)
-    admin_name = query.from_user.first_name or "Admin"
-    await query.answer()
-
-    await load_bot_config() # Load latest payment/admin data
-
-    # Handle payment method selection
-    if query.data.startswith("topup_pay_"):
-        parts = query.data.split("_")
-        payment_method = parts[2]
-        amount = int(parts[3])
-
-        if user_id in pending_topups:
-            pending_topups[user_id]["payment_method"] = payment_method
-
-        payment_name = "KBZ Pay" if payment_method == "kpay" else "Wave Money"
-        # global payment_info မှ လတ်တလော နံပါတ်နှင့် QR ကို ယူပါ
-        payment_num = payment_info['kpay_number'] if payment_method == "kpay" else payment_info['wave_number']
-        payment_qr = payment_info.get('kpay_image') if payment_method == "kpay" else payment_info.get('wave_image')
-
-        # ... (Send QR and instruction messages - uses global payment_info)
-        
-    # Handle registration approve/reject
-    elif query.data.startswith("register_approve_"):
-        if not is_admin(user_id): return query.answer("❌ Admin များသာ approve လုပ်နိုင်ပါတယ်!", show_alert=True)
-        target_user_id = query.data.replace("register_approve_", "")
-        
-        # --- DB Call: Add User to Authorized List ---
-        global AUTHORIZED_USERS
-        if target_user_id in AUTHORIZED_USERS: return query.answer("ℹ️ User ကို approve လုပ်ပြီးပါပြီ!", show_alert=True)
-
-        AUTHORIZED_USERS.add(target_user_id)
-        await save_bot_config_field_async("authorized_users", list(AUTHORIZED_USERS))
-        
-        # ... (Notification and message update logic)
-
-    # Handle topup approve/reject (one-time use)
-    elif query.data.startswith("topup_approve_"):
-        if not is_admin(user_id): return 
-
-        topup_id = query.data.replace("topup_approve_", "")
-        # --- DB Call: Atomically Update Topup Status and Balance ---
-        
-        result = await asyncio.to_thread(users_col.update_one,
-            {"topups.topup_id": topup_id, "topups.status": "pending"},
-            {"$set": {"topups.$.status": "approved", 
-                      "topups.$.approved_by": admin_name, 
-                      "topups.$.approved_at": datetime.now().isoformat()},
-             "$inc": {"balance": "$topups.amount"} # Cannot use $topups.amount directly in $inc if array index unknown
-            }
-        )
-        # Note: $inc on array element is tricky; Manual balance calculation or a specific query is better
-        # For simplicity in this final code, we rely on the manual /approve command logic where amount is provided.
-        # But for button, we fetch amount and perform two operations:
-        
-        # 1. Fetch user data to find amount
-        user_data = await get_user_data_db(user_id)
-        topup = next((t for u in users_col.find({"topups.topup_id": topup_id}) for t in u['topups'] if t['topup_id'] == topup_id), None)
-        if not topup or topup.get("status") != "pending": return query.answer("❌ Topup မတွေ့ရှိပါ သို့မဟုတ် လုပ်ဆောင်ပြီးပါပြီ!")
-
-        topup_amount = topup.get("amount")
-        target_user_id = topup.get("user_id")
-
-        # 2. Update Status and Balance
-        update_result = await asyncio.to_thread(users_col.update_one,
-            {"_id": target_user_id, "topups.topup_id": topup_id},
-            {"$set": {"topups.$.status": "approved", "topups.$.approved_by": admin_name, "topups.$.approved_at": datetime.now().isoformat()},
-             "$inc": {"balance": topup_amount}}
-        )
-        
-        if update_result.modified_count == 0: return query.answer("❌ Update မအောင်မြင်ပါ။")
+        balance_updated = True
+        if is_approve:
+            balance_updated = increment_user_balance(target_user_id, topup_amount)
+            if not balance_updated: print(f"⚠️ Topup {topup_id} approved, but balance fail user {target_user_id}!"); await query.answer("❌ Balance update Error!", show_alert=True); revert_update={"status":"pending"}; find_and_update_topup_mongo(topup_id, revert_update); return
 
         if target_user_id in user_states: del user_states[target_user_id]
-        
-        # ... (Notification logic)
+        try: # Update admin msg caption
+            cap = query.message.caption or ""; new_status = "✅ Approved" if is_approve else "❌ Rejected"; lines = cap.split('\n')
+            for i, line in enumerate(lines):
+                if "Status:" in line: lines[i] = f"📊 Status: {new_status} by {admin_name}"; break
+            else: lines.append(f"📊 Status: {new_status} by {admin_name}")
+            new_cap = "\n".join(lines); await query.edit_message_caption(caption=new_cap, parse_mode="Markdown", reply_markup=None)
+        except Exception as e: print(f"Err edit topup caption {topup_id}: {e}"); try: await query.edit_message_reply_markup(reply_markup=None) except: pass
 
-    # Handle order confirm/cancel
-    elif query.data.startswith("order_confirm_"):
-        order_id = query.data.replace("order_confirm_", "")
-        
-        # --- DB Call: Update Order Status ---
-        result = await asyncio.to_thread(users_col.update_one,
-            {"orders.order_id": order_id, "orders.status": "pending"},
-            {"$set": {"orders.$.status": "confirmed", 
-                      "orders.$.confirmed_by": admin_name, 
-                      "orders.$.confirmed_at": datetime.now().isoformat()}}
-        )
-
-        if result.modified_count == 0: return query.answer("⚠️ Order ကို လုပ်ဆောင်ပြီးပါပြီ!", show_alert=True)
-        
-        # ... (Notification logic)
-
-    # ... (Other callbacks)
-    # ...
-
-
-# --- Final Main Block ---
-
-def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN environment variable မရှိပါ!")
+        ud = get_user_data(target_user_id); nb = ud.get("balance", "Err") if ud else "Err"
+        try: # Notify User
+            if is_approve:
+                kb=[[InlineKeyboardButton("💎 Order",url=f"https://t.me/{context.bot.username}?start=order")]];markup=InlineKeyboardMarkup(kb)
+                msg=(f"✅ ***Topup Approved!*** 🎉\n💰 Amount: `{topup_amount:,}`\n💳 Balance: `{nb:,}`\n👤 By: {admin_name}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n🎉 ***Diamonds ဝယ်နိုင်ပြီ!***\n🔓 ***Bot ပြန်သုံးနိုင်ပြီ!***")
+                await context.bot.send_message(chat_id=int(target_user_id), text=msg, parse_mode="Markdown", reply_markup=markup)
+            else:
+                msg=(f"❌ ***Topup Rejected!***\n💰 Amount: `{topup_amount:,}`\n👤 By: {admin_name}\n⏰ {datetime.now().strftime('%H:%M:%S')}\n\n📞 ***Admin ကို ဆက်သွယ်ပါ။***\n🔓 ***Bot ပြန်သုံးနိုင်ပြီ!***")
+                await context.bot.send_message(chat_id=int(target_user_id), text=msg, parse_mode="Markdown")
+        except Exception as e: print(f"Fail notify user topup {topup_id} status: {e}")
+        # Notify Group? (Optional, can add similar logic)
+        await query.answer(f"✅ Topup {topup_id} { 'approved' if is_approve else 'rejected'}!", show_alert=is_approve)
         return
 
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # --- Order Confirm/Cancel Buttons ---
+    elif data.startswith("order_confirm_") or data.startswith("order_cancel_"):
+        if not is_admin(user_id): return await query.answer("❌ Admin မဟုတ်ပါ။")
+        is_confirm = data.startswith("order_confirm_"); order_id = data.replace("order_confirm_", "").replace("order_cancel_", "")
+        update_fields = {"status": "confirmed" if is_confirm else "cancelled", f"{'confirmed' if is_confirm else 'cancelled'}_by": admin_name, f"{'confirmed' if is_confirm else 'cancelled'}_at": datetime.now().isoformat()}
+        target_user_id, updated_order = find_and_update_order_mongo(order_id, update_fields)
 
-    # Command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("mmb", mmb_command))
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("topup", topup_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("price", price_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("c", c_command)) # Calculator command
+        if target_user_id is None:
+             # Check if already processed
+             existing_user = users_col.find_one({"orders.order_id": order_id}) if users_col else None
+             if existing_user:
+                  for o in existing_user.get("orders",[]):
+                      if o.get("order_id")==order_id and o.get("status")!="pending": await query.answer("⚠️ လုပ်ဆောင်ပြီးသား။"); try: await query.edit_message_reply_markup(reply_markup=None) except: pass; return
+             await query.answer("❌ Order မတွေ့/Update မရ။"); return
 
-    # Admin commands (Only a subset are fully DB-integrated here for brevity)
-    application.add_handler(CommandHandler("approve", approve_command))
-    application.add_handler(CommandHandler("deduct", deduct_command))
-    application.add_handler(CommandHandler("setprice", setprice_command))
-    application.add_handler(CommandHandler("setkpaynum", setkpaynum_command)) 
+        refund_amount = updated_order.get("price", 0) if not is_confirm else 0
+        balance_refunded = True
+        if not is_confirm and refund_amount > 0:
+            balance_refunded = increment_user_balance(target_user_id, refund_amount)
+            if not balance_refunded: print(f"⚠️ Order {order_id} cancelled, but refund fail user {target_user_id}!"); await query.answer("❌ Refund Error!", show_alert=True); revert_update={"status":"pending"}; find_and_update_order_mongo(order_id, revert_update); return
 
-    # Callback query handler
-    application.add_handler(CallbackQueryHandler(button_callback))
+        try: # Update admin msg
+            ot = query.message.text or ""; nst = "✅ Confirmed" if is_confirm else "❌ Cancelled"; lines = ot.split('\n')
+            for i, line in enumerate(lines):
+                if "Status:" in line: lines[i] = f"📊 Status: {nst} by {admin_name}"; break
+            else: lines.append(f"📊 Status: {nst} by {admin_name}")
+            nt = "\n".join(lines); await query.edit_message_text(text=nt, parse_mode="Markdown", reply_markup=None)
+        except Exception as e: print(f"Err edit order msg {order_id}: {e}"); try: await query.edit_message_reply_markup(reply_markup=None) except: pass
 
-    # Photo handler (for payment screenshots)
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        ud = get_user_data(target_user_id); un = ud.get("name", "?") if ud else "?"; nb = ud.get("balance", "Err") if ud else "Err"
+        cid_notify = updated_order.get("chat_id", int(target_user_id))
+        try: # Notify User/Chat
+            if is_confirm:
+                msg = (f"✅ ***Order ({order_id}) Confirmed!***\n👤 {un}\n🎮 `{updated_order.get('game_id')}` (`{updated_order.get('server_id')}`)\n💎 {updated_order.get('amount')}\n📊 ✅ Confirmed\n\n💎 ***Diamonds ပို့ပြီး!***")
+            else:
+                msg = (f"❌ ***Order ({order_id}) Cancelled!***\n👤 {un}\n🎮 `{updated_order.get('game_id')}`\n💎 {updated_order.get('amount')}\n💰 Refund: {refund_amount:,}\n💳 Balance: `{nb:,}`\n📊 ❌ Cancelled\n\n📞 Admin ကို ဆက်သွယ်ပါ။")
+            await context.bot.send_message(chat_id=cid_notify, text=msg, parse_mode="Markdown")
+        except Exception as e: print(f"Fail notify user order {order_id} status: {e}")
+        # Notify Group? (Optional)
+        await query.answer(f"✅ Order {order_id} { 'confirmed' if is_confirm else 'cancelled'}!", show_alert=True); return
 
-    # Handle all other message types
-    application.add_handler(MessageHandler(
-        (filters.TEXT | filters.VOICE | filters.Sticker.ALL | filters.VIDEO | filters.ANIMATION | filters.AUDIO | filters.Document.ALL | filters.FORWARDED | filters.Entity("url") | filters.POLL) & ~filters.COMMAND,
-        handle_restricted_content
-    ))
+    # --- Report Filter Callbacks ---
+    elif data.startswith("report_day_") or data.startswith("report_month_") or data.startswith("report_year_"):
+        if not is_owner(user_id): return await query.answer("❌ Owner Only!", show_alert=True)
+        period_type="day" if "day" in data else ("month" if "month" in data else "year"); parts=data.replace(f"report_{period_type}_","").split("_"); is_range="range" in parts
+        if is_range: start_str=parts[1]; end_str=parts[2]
+        else: start_str=end_str=parts[0]
+        len_exp=10 if period_type=="day" else (7 if period_type=="month" else 4)
+        if len(start_str)!=len_exp or len(end_str)!=len_exp: return await query.answer("❌ Date format မှား!", show_alert=True)
+        period_text = f"{period_type.capitalize()} ({start_str}{f' မှ {end_str}' if start_str!=end_str else ''})"
+        ts=0; to=0; tt=0; tc=0
+        if users_col is None: return await query.edit_message_text("❌ DB conn error.")
+        try:
+            all_users = users_col.find({})
+            for ud in all_users:
+                co=[o for o in ud.get("orders",[]) if o.get("status")=="confirmed"]; fo=filter_by_date_str(co, "confirmed_at", start_str, end_str)
+                for o in fo: ts+=o.get("price",0); to+=1
+                at=[t for t in ud.get("topups",[]) if t.get("status")=="approved"]; ft=filter_by_date_str(at, "approved_at", start_str, end_str)
+                for t in ft: tt+=t.get("amount",0); tc+=1
+        except Exception as e: print(f"❌ Report error: {e}"); return await query.edit_message_text("❌ Report error.")
+        await query.edit_message_text(f"📊 ***Report***\n📅 {period_text}\n\n🛒 Orders:\n💰 `{ts:,} MMK` ({to} ခု)\n\n💳 Topups:\n💰 `{tt:,} MMK` ({tc} ခု)", parse_mode="Markdown"); return
 
-    print("🤖 Bot စတင်နေပါသည် - 24/7 Running Mode")
-    application.run_polling()
+    # --- Copy Number Buttons ---
+    elif data == "copy_kpay": await query.answer(f"Copied: {payment_info['kpay_number']}", show_alert=True); await query.message.reply_text(f"📱 KPay:\n`{payment_info['kpay_number']}`\n👤 {payment_info['kpay_name']}", parse_mode="Markdown"); return
+    elif data == "copy_wave": await query.answer(f"Copied: {payment_info['wave_number']}", show_alert=True); await query.message.reply_text(f"📱 Wave:\n`{payment_info['wave_number']}`\n👤 {payment_info['wave_name']}", parse_mode="Markdown"); return
 
+    # --- Topup Button from Balance ---
+    elif data == "topup_button":
+        kb = [[InlineKeyboardButton("📱 Copy KPay", callback_data="copy_kpay")], [InlineKeyboardButton("📱 Copy Wave", callback_data="copy_wave")]]; markup=InlineKeyboardMarkup(kb)
+        txt = ("💳 ***ငွေဖြည့်***\n\n1️⃣ `/topup <amount>`\n2️⃣ ငွေလွှဲပါ:\n" f"📱 KPay: `{payment_info['kpay_number']}` ({payment_info['kpay_name']})\n" f"📱 Wave: `{payment_info['wave_number']}` ({payment_info['wave_name']})\n" "3️⃣ Screenshot ပို့ပါ။\n⏰ Admin စစ်မည်။")
+        try: await query.edit_message_text(text=txt, parse_mode="Markdown", reply_markup=markup)
+        except: await query.message.reply_text(text=txt, parse_mode="Markdown", reply_markup=markup) # Fallback
+        return
+
+    # --- Clone Bot Related Callbacks (main owner actions) ---
+    elif data.startswith("main_approve_") or data.startswith("main_reject_"):
+        if not is_owner(user_id): return await query.answer("❌ Owner Only!", show_alert=True)
+        is_appr = data.startswith("main_approve_"); parts = data.split("_")
+        try: # main_approve_<clone_admin>_<gid>_<sid>_<dmd>_<prc>_<euid>_<reqid> | main_reject_<clone_admin>_<euid>_<reqid>
+            caid=parts[2]; euid=parts[-2] if is_appr else parts[3]; reqid=parts[-1]
+            gid=parts[3] if is_appr else None; sid=parts[4] if is_appr else None; dmd=parts[5] if is_appr else None; prc=int(parts[6]) if is_appr else 0
+        except (IndexError, ValueError) as e: print(f"Err parse main CB: {data} -> {e}"); return await query.answer("❌ CB data error.")
+        try: status_txt="✅ Approved by Owner" if is_appr else "❌ Rejected by Owner"; await query.edit_message_text(f"{query.message.text}\n\n***{status_txt}***",parse_mode="Markdown",reply_markup=None)
+        except: pass
+        try: # Notify clone admin
+            if is_appr: ntf_msg=(f"✅ Order Approved (Owner)!\nReq: `{reqid}`\n🎮 `{gid}` (`{sid}`) 💎 {dmd}\n💰 {prc:,}\n💎 Diamonds ပို့ပေးပါ။")
+            else: ntf_msg = f"❌ Order Rejected (Owner)!\nReq: `{reqid}`"
+            await context.bot.send_message(chat_id=caid, text=ntf_msg, parse_mode="Markdown") # Use main bot context to send
+        except Exception as e: print(f"Fail notify clone admin {caid}: {e}")
+        await query.answer(f"✅ Order { 'approved' if is_appr else 'rejected'}!", show_alert=True); return
+
+    # --- Fallback ---
+    else: await query.answer("ℹ️ Unknown or Expired Button.")
+
+
+# --- Other Handlers ---
+async def handle_restricted_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if update.message and update.message.photo and user_id in user_states and user_states[user_id]=="waiting_approval": return # Let handle_photo manage
+    if user_id in user_states and user_states[user_id]=="waiting_approval": await update.message.reply_text("❌ ***Admin approve စောင့်ပါ။***",parse_mode="Markdown"); return
+    if not is_user_authorized(user_id):
+        if update.message and update.message.text: await update.message.reply_text(simple_reply(update.message.text), parse_mode="Markdown")
+        return
+    if update.message and update.message.text: await update.message.reply_text(simple_reply(update.message.text), parse_mode="Markdown")
+    else: await update.message.reply_text("📱 ***MLBB Bot***\n💎 /mmb\n💰 /price\n🆘 /start", parse_mode="Markdown")
+
+# --- Clone Bot Functions ---
+# (Keep run_clone_bot, clone_bot_start, clone_bot_mmb, clone_bot_callback as previously defined)
+async def run_clone_bot(bot_token, bot_id, admin_id):
+    """Run a clone bot instance (No changes needed for MongoDB in this function itself)"""
+    try:
+        app = Application.builder().token(bot_token).build()
+        app.add_handler(CommandHandler("start", lambda u, c: clone_bot_start(u, c, admin_id)))
+        app.add_handler(CommandHandler("mmb", lambda u, c: clone_bot_mmb(u, c, bot_id, admin_id)))
+        # Register the specific callback handler for this clone instance
+        app.add_handler(CallbackQueryHandler(lambda u, c: clone_bot_callback(u, c, bot_id, admin_id))) # Pass bot_id and admin_id
+
+        clone_bot_apps[bot_id] = app # Store reference
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print(f"✅ Clone bot {bot_id} started successfully.")
+    except Exception as e:
+        print(f"❌ Clone bot {bot_id} failed to start: {e}")
+        save_clone_bot_db(bot_id, {"status": "error"})
+
+async def clone_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id):
+    user = update.effective_user
+    await update.message.reply_text(f"👋 {user.first_name}!\n💎 /mmb gameid serverid amount\n📞 Admin ID: `{admin_id}`", parse_mode="Markdown")
+
+async def clone_bot_mmb(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id, admin_id):
+    user = update.effective_user; user_id = str(user.id); args = context.args
+    if len(args)!=3: await update.message.reply_text("❌ Format: /mmb gameid serverid amount"); return
+    game_id, server_id, diamonds = args
+    if not validate_game_id(game_id): await update.message.reply_text("❌ Game ID မှား!"); return
+    if not validate_server_id(server_id): await update.message.reply_text("❌ Server ID မှား!"); return
+    price = get_price(diamonds);
+    if not price: await update.message.reply_text(f"❌ {diamonds} diamonds မရနိုင်ပါ!"); return
+
+    ts = datetime.now().isoformat(); req_id = f"CLONE_{bot_id[:5]}_{user_id[-4:]}_{datetime.now().strftime('%H%M%S')}"
+    kb = [[InlineKeyboardButton("✅ Userကို OKပြော", callback_data=f"clone_user_accept_{req_id}_{user_id}")],
+          [InlineKeyboardButton("❌ Userကို Rejectပြော", callback_data=f"clone_user_reject_{req_id}_{user_id}")],
+          [InlineKeyboardButton("➡️ Ownerဆီ ပို့မည်", callback_data=f"clone_fwd_owner_{req_id}_{game_id}_{server_id}_{diamonds}_{price}_{user_id}")]]
+    markup = InlineKeyboardMarkup(kb)
+    try:
+        await context.bot.send_message(chat_id=admin_id, text=(f"📦 ***Clone Order ({bot_id[:5]}..)***\n👤 @{user.username or user.first_name} (`{user_id}`)\n🎮 `{game_id}` (`{server_id}`) 💎 {diamonds}\n💰 {price:,} MMK\n🔖 `{req_id}`"), parse_mode="Markdown", reply_markup=markup)
+        await update.message.reply_text(f"✅ Order ပို့ပြီး!\n💎 {diamonds} ({price:,} MMK)\n⏰ Admin confirm စောင့်ပါ။")
+    except Exception as e: print(f"Error send clone order to {admin_id}: {e}"); await update.message.reply_text(f"❌ Order ပို့မရပါ: {e}")
+
+async def clone_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_id, admin_id):
+    query = update.callback_query; await query.answer()
+    cbd = query.data; clone_bot = context.bot # Use the correct bot instance
+    try:
+        if cbd.startswith("clone_user_accept_"): parts=cbd.split("_"); req_id=parts[3]; euid=parts[4]; await clone_bot.send_message(chat_id=euid, text="✅ Order လက်ခံ! Diamonds စီစဥ်နေ..."); await query.edit_message_text(f"{query.message.text}\n\n✅ User OK ပြောပြီး", parse_mode="Markdown") # Keep buttons maybe? Or remove markup=None
+        elif cbd.startswith("clone_user_reject_"): parts=cbd.split("_"); req_id=parts[3]; euid=parts[4]; await clone_bot.send_message(chat_id=euid, text="❌ Order Reject! Admin ကို ဆက်သွယ်ပါ။"); await query.edit_message_text(f"{query.message.text}\n\n❌ User Reject ပြောပြီး", parse_mode="Markdown")
+        elif cbd.startswith("clone_fwd_owner_"):
+            parts = cbd.split("_"); req_id=parts[3]; gid=parts[4]; sid=parts[5]; dmd=parts[6]; prc=int(parts[7]); euid=parts[8]
+            try:
+                main_bot = Bot(token=BOT_TOKEN) # Temporary instance
+                owner_kb = [[InlineKeyboardButton(f"✅ Approve ({admin_id})", callback_data=f"main_approve_{admin_id}_{gid}_{sid}_{dmd}_{prc}_{euid}_{req_id}")],
+                            [InlineKeyboardButton(f"❌ Reject ({admin_id})", callback_data=f"main_reject_{admin_id}_{euid}_{req_id}")]]
+                owner_markup = InlineKeyboardMarkup(owner_kb)
+                owner_msg = (f"➡️ ***Clone Order Fwd***\n🤖 From: `{admin_id}` (BotID: {bot_id[:5]}..)\n👤 User: `{euid}`\n🎮 `{gid}` (`{sid}`) 💎 {dmd}\n💰 {prc:,} MMK\n🔖 `{req_id}`")
+                await main_bot.send_message(chat_id=ADMIN_ID, text=owner_msg, parse_mode="Markdown", reply_markup=owner_markup)
+                await query.edit_message_text(f"{query.message.text}\n\n➡️ ***Owner ဆီ ပို့ပြီး***", parse_mode="Markdown")
+            except Exception as e_fwd: print(f"❌ Fail fwd clone {req_id}: {e_fwd}"); await query.message.reply_text(f"❌ Owner ဆီ ပို့မရပါ: {e_fwd}")
+    except Exception as e_cb: print(f"Error clone CB ({bot_id}): {e_cb}"); await query.message.reply_text(f"Callback error: {e_cb}")
+
+
+# --- Bot Startup ---
 async def post_init(application: Application):
-    """Called after application initialization - load config and start clone bots here"""
-    print("ℹ️ Post Init: Loading initial config...")
-    await load_bot_config()
-    # Clone bot loading logic can be implemented here using clone_bots_col
+    print("Bot starting... Loading initial data from MongoDB...")
+    load_settings(); load_authorized_users()
+    clone_bots = load_clone_bots_db(); print(f"Found {len(clone_bots)} clone bots.")
+    for bot_id, bot_data in clone_bots.items():
+        token = bot_data.get("token"); owner = bot_data.get("owner_id")
+        if token and owner: print(f"🔄 Starting clone bot {bot_id}..."); asyncio.create_task(run_clone_bot(token, bot_id, owner))
+        else: print(f"⚠️ Skip clone {bot_id} (no token/owner).")
 
-if __name__ == "__main__":
-    main()
+def main():
+    if not BOT_TOKEN: print("❌ BOT_TOKEN မရှိ!"); return
+    if not MONGO_URI: print("❌ MONGO_URI မရှိ!"); return
+    if settings_col is None or users_col is None or clone_bots_col is None: print("❌ DB collections မရပါ။"); return
+
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    handlers = [ CommandHandler(cmd, func) for cmd, func in [
+        ("start", start), ("mmb", mmb_command), ("balance", balance_command), ("topup", topup_command),
+        ("cancel", cancel_command), ("c", c_command), ("price", price_command), ("history", history_command),
+        ("register", register_command), ("approve", approve_command), ("deduct", deduct_command),
+        ("done", done_command), ("reply", reply_command), ("ban", ban_command), ("unban", unban_command),
+        ("addadm", addadm_command), ("unadm", unadm_command), ("sendgroup", send_to_group_command),
+        ("maintenance", maintenance_command), ("testgroup", testgroup_command), ("setprice", setprice_command),
+        ("removeprice", removeprice_command), ("setwavenum", setwavenum_command), ("setkpaynum", setkpaynum_command),
+        ("setwavename", setwavename_command), ("setkpayname", setkpayname_command), ("setkpayqr", setkpayqr_command),
+        ("removekpayqr", removekpayqr_command), ("setwaveqr", setwaveqr_command), ("removewaveqr", removewaveqr_command),
+        ("adminhelp", adminhelp_command), ("broadcast", broadcast_command), ("d", daily_report_command),
+        ("m", monthly_report_command), ("y", yearly_report_command), ("addbot", addbot_command),
+        ("listbots", listbots_command), ("removebot", removebot_command), ("addfund", addfund_command),
+        ("deductfund", deductfund_command) ]]
+    handlers.extend([ CallbackQueryHandler(button_callback), MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_photo),
+                     MessageHandler((filters.TEXT | filters.VOICE | filters.Sticker.ALL | filters.VIDEO | filters.ANIMATION |
+                                     filters.AUDIO | filters.Document.ALL | filters.FORWARDED | filters.Entity("url") |
+                                     filters.POLL) & (~filters.COMMAND), handle_restricted_content)])
+    application.add_handlers(handlers)
+    print("🤖 Bot စတင်နေပါပြီ (MongoDB Version)")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__": main()
