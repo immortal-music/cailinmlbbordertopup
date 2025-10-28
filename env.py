@@ -1,12 +1,37 @@
+import os
+from dotenv import load_dotenv
 
-BOT_TOKEN = "8257255279:AAFp6kNzbb-KGjAykevQeuteGci_uJ8Nwds"  # ဒီနေရာမှာ သင့်တကယ့် Bot Token ကို ထည့်ပါ
-ADMIN_ID = 1318826936         # ဒီနေရာမှာ သင့်တကယ့် Admin User ID (ဂဏန်း) ကို ထည့်ပါ
-ADMIN_GROUP_ID = -1002658705688 # ဒီနေရာမှာ သင့်တကယ့် Admin Group ID (အနှုတ်နဲ့စတဲ့ ဂဏန်း) ကို ထည့်ပါ
+# .env file ထဲက variables တွေကို local မှာ run ရင် load လုပ်မယ်
+# Render ပေါ်မှာ run ရင် .env file မရှိတဲ့အတွက် ဒီ function က ဘာမှမလုပ်ပါဘူး
+load_dotenv()
 
-# --- MongoDB Settings ---
-# သင့် MongoDB Atlas ကနေ ရလာတဲ့ Connection String ကို ဒီမှာ ထည့်ပါ
-# သင့် password ကို သေချာ မှန်အောင် ထည့်ထားဖို့ လိုပါတယ်
-MONGO_URI = "mongodb+srv://wanglinmongodb:wanglin@cluster0.tny5vhz.mongodb.net/?retryWrites=true&w=majority"
+# Environment variables တွေကို os.environ ကနေ ဖတ်မယ်
+# Render ကနေ ထည့်ပေးလိုက်တဲ့ variables တွေက ဒီနေရာကနေ ဝင်လာမှာပါ
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID_STR = os.environ.get("ADMIN_ID")
+ADMIN_GROUP_ID_STR = os.environ.get("ADMIN_GROUP_ID")
+MONGO_URI = os.environ.get("MONGO_URI")
 
-# --- Deprecated (JSON File) ---
-# DATA_FILE = "data.json" # ဒီလိုင်းကို မသုံးတော့ပါဘူး။ ဖျက်လိုက်လဲ ရပါတယ် (သို့) # နဲ့ comment ပိတ်ထားပါ။
+# --- Variables Validation ---
+ADMIN_ID = 0
+if ADMIN_ID_STR and ADMIN_ID_STR.isdigit():
+    ADMIN_ID = int(ADMIN_ID_STR)
+else:
+    print("⚠️ WARNING: ADMIN_ID is not set or not a number in environment variables.")
+
+ADMIN_GROUP_ID = 0
+if ADMIN_GROUP_ID_STR:
+    try:
+        ADMIN_GROUP_ID = int(ADMIN_GROUP_ID_STR)
+    except ValueError:
+        print(f"⚠️ WARNING: ADMIN_GROUP_ID '{ADMIN_GROUP_ID_STR}' is not a valid number.")
+else:
+    print("⚠️ WARNING: ADMIN_GROUP_ID is not set in environment variables.")
+
+
+if not BOT_TOKEN:
+    print("❌ FATAL ERROR: BOT_TOKEN is not set in environment variables.")
+    # (Optional) raise ValueError("BOT_TOKEN not found in environment")
+if not MONGO_URI:
+    print("❌ FATAL ERROR: MONGO_URI is not set in environment variables.")
+    # (Optional) raise ValueError("MONGO_URI not found in environment")
